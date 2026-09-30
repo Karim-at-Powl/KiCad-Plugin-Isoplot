@@ -9,10 +9,11 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from kipy.board_types import Pad, Track, Via, Zone
+from kipy.board_types import BoardArc, BoardCircle, BoardSegment, Pad, Track, Via, Zone
 from kipy.errors import ApiError
-from kipy.geometry import PolygonWithHoles
+from kipy.geometry import PolygonWithHoles, Vector2
 from kipy.proto.board import board_types_pb2 as bt
+from kipy.proto.board.board_types_pb2 import BoardLayer
 from kipy.proto.common import ApiStatusCode
 from kipy.proto.common.types import base_types_pb2 as base
 
@@ -193,6 +194,55 @@ def test_via_diameter_front_inner_back():
     assert ks._via_diameter(v, F) == 600_000
     assert ks._via_diameter(v, ks._COPPER_ORDER[5]) == 400_000
     assert ks._via_diameter(v, B) == 500_000
+
+
+def _edge_segment(x0, y0, x1, y1):
+    s = BoardSegment()
+    s.layer = BoardLayer.BL_Edge_Cuts
+    s.start, s.end = Vector2.from_xy(x0, y0), Vector2.from_xy(x1, y1)
+    return s
+
+
+def _edge_arc(start, mid, end):
+    a = BoardArc()
+    a.layer = BoardLayer.BL_Edge_Cuts
+    a.start, a.mid, a.end = (Vector2.from_xy(*p) for p in (start, mid, end))
+    return a
+
+
+def test_board_outline_chains_segments_and_arcs():
+    """A 20 x 10 mm board with one rounded corner, drawn as separate segments
+    in mixed directions, plus a round cut-out and a silkscreen line."""
+    r = 2 * MM
+    c = int(r * (1 - 1 / math.sqrt(2)))
+    shapes = [
+        _edge_segment(0, 0, 20 * MM - r, 0),
+        _edge_arc((20 * MM - r, 0), (20 * MM - c, c), (20 * MM, r)),
+        _edge_segment(20 * MM, 10 * MM, 20 * MM, r),        # reversed
+        _edge_segment(20 * MM, 10 * MM, 0, 10 * MM),
+        _edge_segment(0, 0, 0, 10 * MM),                     # reversed
+    ]
+    hole = BoardCircle()
+    hole.layer = BoardLayer.BL_Edge_Cuts
+    hole.center, hole.radius_point = Vector2.from_xy(5 * MM, 5 * MM), Vector2.from_xy(6 * MM, 5 * MM)
+    silk = _edge_segment(0, 0, MM, MM)
+    silk.layer = BoardLayer.BL_F_SilkS
+    board = board_fixture()
+    board.get_shapes = lambda: shapes + [hole, silk]
+    fp, rings, chains = ks.BoardReader(board).board_outline()
+    assert len(rings) == 2 and not chains, (len(rings), len(chains))
+    outer = max(rings, key=lambda ring: max(p[0] for p in ring) - min(p[0] for p in ring))
+    xs = [p[0] for p in outer]
+    ys = [p[1] for p in outer]
+    assert [round(v) for v in (min(xs), min(ys), max(xs), max(ys))] == [0, 0, 20 * MM, 10 * MM]
+    # moving an edge changes the fingerprint
+    shapes[3].end = Vector2.from_xy(0, 11 * MM)
+    assert ks.BoardReader(board).board_outline()[0] != fp
+
+
+def test_chain_leaves_open_pieces_open():
+    rings, chains = ks._chain([[(0, 0), (10, 0)], [(10, 0), (10, 10)]], tol=0)
+    assert not rings and len(chains) == 1 and len(chains[0]) == 3
 
 
 def test_sample_arc_both_directions():

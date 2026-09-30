@@ -8,12 +8,16 @@ the along-copper distance and board position.
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import wx
 
 # Background the transparent heatmap is composited over (light grey so the
 # black seed pad and the copper colours both read well).
-_BG_COLOUR = (235, 235, 235)
+_BG_COLOUR = (215, 215, 215)       # outside the board
+_BOARD_COLOUR = (245, 245, 245)    # inside the board outline
+_EDGE_COLOUR = (70, 70, 70)        # Edge.Cuts
 _OPACITY = 0.6
 _VIEW_W = 760
 _VIEW_H = 620
@@ -89,81 +93,218 @@ class _GradientBar(wx.Panel):
         self.SetSizer(frame)
 
 
-class _HeatmapPanel(wx.Panel):
-    """Owner-drawn heatmap view.
+class _BoardView(wx.Panel):
+    """Owner-drawn board view in world coordinates (nm).
 
-    Holds the grid-resolution heatmap image, scales it to fit the client area
-    (cached per size), and draws the seed copper filled black on top.
+    The frame of reference is the board outline, so the view doesn't jump when
+    switching between nets of different size. The heatmap image is placed at
+    its true position; the mouse wheel zooms around the cursor, dragging pans,
+    and a double-click fits the whole board again.
     """
+
+    _MARGIN = 12      # px around the fitted board
+    _ZOOM_STEP = 1.25
 
     def __init__(self, parent, size, on_motion):
         super().__init__(parent, size=size)
         self._img = None
-        self._bmp = None
-        self._bmp_key = None
-        self._seed_shapes = ()
+        self._img_origin = (0.0, 0.0)   # world position of the image's top-left
+        self._img_pitch = 1.0           # nm per image pixel
+        self._seeds = ()                # ("disc", x, y, r) / ("poly", [(x, y)...]) in nm
+        self._rings = []                # closed board outline rings (nm)
+        self._chains = []               # open outline pieces (nm)
         self._message = "Starting..."
+        self._zoom = 1.0
+        self._center = None             # world point at the view centre; None = fitted
+        self._drag = None
+        self._cache_key = None
+        self._cache_bmp = None
         self._on_motion = on_motion
-        self._scale = 0.0
-        self._off_x = 0
-        self._off_y = 0
         self.SetBackgroundStyle(wx.BG_STYLE_PAINT)
         self.Bind(wx.EVT_PAINT, self._on_paint)
         self.Bind(wx.EVT_SIZE, lambda e: (self.Refresh(), e.Skip()))
-        self.Bind(wx.EVT_MOTION, lambda e: self._on_motion(e.GetPosition()))
+        self.Bind(wx.EVT_MOUSEWHEEL, self._on_wheel)
+        self.Bind(wx.EVT_LEFT_DOWN, self._on_left_down)
+        self.Bind(wx.EVT_LEFT_UP, self._on_left_up)
+        self.Bind(wx.EVT_MOUSE_CAPTURE_LOST, lambda e: setattr(self, "_drag", None))
+        self.Bind(wx.EVT_LEFT_DCLICK, lambda e: self.fit())
+        self.Bind(wx.EVT_MOTION, self._on_mouse_motion)
         self.Bind(wx.EVT_LEAVE_WINDOW, lambda e: self._on_motion(None))
 
-    def set_image(self, img, seed_shapes=(), message=None):
-        self._img = img
-        self._bmp = None
-        self._seed_shapes = seed_shapes
-        self._message = message
+    # -- content ------------------------------------------------------------
+    def set_outline(self, rings, chains):
+        old = self._bounds()
+        self._rings, self._chains = rings, chains
+        if self._bounds() != old:
+            self.fit()
         self.Refresh()
 
-    def cell_at(self, pos):
-        """Map a client-coordinate position to image-grid (ix, iy), or None."""
-        if self._img is None or self._scale <= 0:
-            return None
-        ix = int((pos[0] - self._off_x) / self._scale)
-        iy = int((pos[1] - self._off_y) / self._scale)
-        if 0 <= ix < self._img.GetWidth() and 0 <= iy < self._img.GetHeight():
-            return ix, iy
+    def set_heatmap(self, img, origin, pitch, seeds):
+        """``origin`` is the world centre of pixel (0, 0); ``pitch`` nm/pixel."""
+        had_frame = self._bounds() is not None
+        self._img = img
+        self._img_pitch = float(pitch)
+        self._img_origin = (origin[0] - pitch / 2.0, origin[1] - pitch / 2.0)
+        self._seeds = seeds
+        self._message = None
+        if not had_frame:
+            self.fit()
+        self.Refresh()
+
+    def set_message(self, text):
+        self._img = None
+        self._seeds = ()
+        self._message = text
+        self.Refresh()
+
+    def fit(self):
+        self._zoom = 1.0
+        self._center = None
+        self.Refresh()
+
+    # -- view transform -----------------------------------------------------
+    def _bounds(self):
+        """World box of the fitted view: the board outline, else the heatmap."""
+        pts = [p for ring in self._rings for p in ring] + [p for c in self._chains for p in c]
+        if pts:
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            return (min(xs), min(ys), max(xs), max(ys))
+        if self._img is not None:
+            x0, y0 = self._img_origin
+            return (x0, y0, x0 + self._img.GetWidth() * self._img_pitch,
+                    y0 + self._img.GetHeight() * self._img_pitch)
         return None
 
+    def _view(self):
+        """(scale px/nm, world centre), or None when there is nothing to show."""
+        box = self._bounds()
+        w, h = self.GetClientSize()
+        if box is None or w < 2 * self._MARGIN + 2 or h < 2 * self._MARGIN + 2:
+            return None
+        bw = max(1.0, box[2] - box[0])
+        bh = max(1.0, box[3] - box[1])
+        fit = min((w - 2 * self._MARGIN) / bw, (h - 2 * self._MARGIN) / bh)
+        center = self._center or ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0)
+        return fit * self._zoom, center
+
+    def to_screen(self, x, y, view):
+        s, (cx, cy) = view
+        w, h = self.GetClientSize()
+        return ((x - cx) * s + w / 2.0, (y - cy) * s + h / 2.0)
+
+    def to_world(self, px, py, view):
+        s, (cx, cy) = view
+        w, h = self.GetClientSize()
+        return ((px - w / 2.0) / s + cx, (py - h / 2.0) / s + cy)
+
+    # -- painting -----------------------------------------------------------
     def _on_paint(self, _evt):
         dc = wx.AutoBufferedPaintDC(self)
         dc.SetBackground(wx.Brush(wx.Colour(*_BG_COLOUR)))
         dc.Clear()
-        w, h = self.GetClientSize()
-        if self._message is not None:
+        view = self._view()
+        if view is not None:
+            self._draw_board(dc, view)
+        if self._message:
             dc.SetTextForeground(wx.Colour(60, 60, 60))
             dc.DrawText(self._message, 20, 20)
-            return
-        if self._img is None or w < 2 or h < 2:
-            return
 
-        iw, ih = self._img.GetWidth(), self._img.GetHeight()
-        self._scale = min(w / float(iw), h / float(ih))
-        sw = max(1, int(iw * self._scale))
-        sh = max(1, int(ih * self._scale))
-        self._off_x = (w - sw) // 2
-        self._off_y = (h - sh) // 2
-        if self._bmp_key != (sw, sh) or self._bmp is None:
-            self._bmp = wx.Bitmap(self._img.Scale(sw, sh, wx.IMAGE_QUALITY_NORMAL))
-            self._bmp_key = (sw, sh)
-        dc.DrawBitmap(self._bmp, self._off_x, self._off_y, True)
+    def _draw_board(self, dc, view):
+        def pts(poly):
+            return [wx.Point(int(sx), int(sy))
+                    for sx, sy in (self.to_screen(x, y, view) for (x, y) in poly)]
+
+        if self._rings:  # board area (even-odd, so cut-outs stay grey)
+            dc.SetPen(wx.TRANSPARENT_PEN)
+            dc.SetBrush(wx.Brush(wx.Colour(*_BOARD_COLOUR)))
+            # One polygon through all rings; each bridge from the anchor is
+            # traversed out and back, so even-odd filling cancels it.
+            anchor = self._rings[0][0]
+            joined = []
+            for ring in self._rings:
+                joined += [anchor] + ring + [ring[0]]
+            dc.DrawPolygon(pts(joined), fill_style=wx.ODDEVEN_RULE)
+
+        if self._img is not None:
+            self._draw_heatmap(dc, view)
+
+        dc.SetBrush(wx.TRANSPARENT_BRUSH)
+        dc.SetPen(wx.Pen(wx.Colour(*_EDGE_COLOUR), 2))
+        for poly in self._rings + self._chains:
+            dc.DrawLines(pts(poly))
 
         dc.SetPen(wx.Pen(wx.Colour(0, 0, 0), 1))
         dc.SetBrush(wx.Brush(wx.Colour(0, 0, 0)))
-        s, ox, oy = self._scale, self._off_x, self._off_y
-        for shape in self._seed_shapes:
+        for shape in self._seeds:
             if shape[0] == "disc":
-                _, gx, gy, gr = shape
-                dc.DrawCircle(int(ox + gx * s), int(oy + gy * s), max(2, int(gr * s)))
-            else:
-                pts = [wx.Point(int(ox + gx * s), int(oy + gy * s)) for (gx, gy) in shape[1]]
-                if len(pts) >= 3:
-                    dc.DrawPolygon(pts)
+                _, x, y, r = shape
+                sx, sy = self.to_screen(x, y, view)
+                dc.DrawCircle(int(sx), int(sy), max(2, int(r * view[0])))
+            elif len(shape[1]) >= 3:
+                dc.DrawPolygon(pts(shape[1]))
+
+    def _draw_heatmap(self, dc, view):
+        """Crop the heatmap to the visible area and scale only that part."""
+        s = view[0]
+        w, h = self.GetClientSize()
+        x0, y0 = self._img_origin
+        p = self._img_pitch
+        iw, ih = self._img.GetWidth(), self._img.GetHeight()
+        vx0, vy0 = self.to_world(0, 0, view)
+        vx1, vy1 = self.to_world(w, h, view)
+        ix0 = max(0, math.floor((vx0 - x0) / p))
+        iy0 = max(0, math.floor((vy0 - y0) / p))
+        ix1 = min(iw, math.ceil((vx1 - x0) / p))
+        iy1 = min(ih, math.ceil((vy1 - y0) / p))
+        if ix1 <= ix0 or iy1 <= iy0:
+            return
+        sx, sy = self.to_screen(x0 + ix0 * p, y0 + iy0 * p, view)
+        sw = max(1, int(round((ix1 - ix0) * p * s)))
+        sh = max(1, int(round((iy1 - iy0) * p * s)))
+        key = (id(self._img), ix0, iy0, ix1, iy1, sw, sh)
+        if key != self._cache_key:
+            sub = self._img.GetSubImage(wx.Rect(ix0, iy0, ix1 - ix0, iy1 - iy0))
+            self._cache_bmp = wx.Bitmap(sub.Scale(sw, sh, wx.IMAGE_QUALITY_NORMAL))
+            self._cache_key = key
+        dc.DrawBitmap(self._cache_bmp, int(round(sx)), int(round(sy)), True)
+
+    # -- mouse --------------------------------------------------------------
+    def _on_wheel(self, evt):
+        view = self._view()
+        if view is None:
+            return
+        steps = evt.GetWheelRotation() / float(evt.GetWheelDelta() or 120)
+        new_zoom = min(500.0, max(0.5, self._zoom * self._ZOOM_STEP ** steps))
+        # Keep the world point under the cursor where it is.
+        px, py = evt.GetPosition()
+        ux, uy = self.to_world(px, py, view)
+        s_new = view[0] * new_zoom / self._zoom
+        w, h = self.GetClientSize()
+        self._zoom = new_zoom
+        self._center = (ux - (px - w / 2.0) / s_new, uy - (py - h / 2.0) / s_new)
+        self.Refresh()
+
+    def _on_left_down(self, evt):
+        view = self._view()
+        if view is not None:
+            self._drag = (evt.GetPosition(), view[1])
+            self.CaptureMouse()
+
+    def _on_left_up(self, _evt):
+        self._drag = None
+        if self.HasCapture():
+            self.ReleaseMouse()
+
+    def _on_mouse_motion(self, evt):
+        view = self._view()
+        if self._drag is not None and evt.LeftIsDown() and view is not None:
+            (x0, y0), (cx, cy) = self._drag
+            x, y = evt.GetPosition()
+            self._center = (cx - (x - x0) / view[0], cy - (y - y0) / view[0])
+            self.Refresh()
+            view = self._view()
+        self._on_motion(self.to_world(*evt.GetPosition(), view) if view else None)
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +323,8 @@ class IsoplotFrame(wx.Frame):
         self._layer_names = None
         self._unticked = set()      # layer names the user switched off
         self._checks = []           # (layer_index, wx.CheckBox)
+        self._status = ""           # last status text (restored after "busy")
+        self._busy = False
         self._build_ui()
         self.CreateStatusBar()
         self.SetStatusText("Connecting to KiCad...")
@@ -203,7 +346,7 @@ class IsoplotFrame(wx.Frame):
         outer.Add(self._cursor, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
 
         body = wx.BoxSizer(wx.HORIZONTAL)
-        self._view = _HeatmapPanel(p, (_VIEW_W, _VIEW_H), self._on_motion)
+        self._view = _BoardView(p, (_VIEW_W, _VIEW_H), self._on_motion)
         body.Add(self._view, 1, wx.EXPAND | wx.ALL, 8)
 
         right = wx.BoxSizer(wx.VERTICAL)
@@ -225,7 +368,14 @@ class IsoplotFrame(wx.Frame):
         refresh = wx.Button(p, label="Refresh")
         refresh.SetToolTip("Re-read the board and recompute now")
         refresh.Bind(wx.EVT_BUTTON, lambda e: self._session and self._session.refresh())
-        right.Add(refresh, 0, wx.TOP, 8)
+        right.Add(refresh, 0, wx.TOP | wx.EXPAND, 8)
+        outline = wx.Button(p, label="Update Board Outline")
+        outline.SetToolTip("Re-read Edge.Cuts after editing the board outline")
+        outline.Bind(wx.EVT_BUTTON,
+                     lambda e: self._session and self._session.refresh_outline())
+        right.Add(outline, 0, wx.TOP | wx.EXPAND, 4)
+        right.Add(wx.StaticText(p, label="Wheel: zoom    Drag: pan\nDouble-click: whole board"),
+                  0, wx.TOP, 8)
 
         body.Add(right, 0, wx.EXPAND | wx.ALL, 8)
         outer.Add(body, 1, wx.EXPAND)
@@ -274,11 +424,22 @@ class IsoplotFrame(wx.Frame):
 
     # -- called by the live session (on the UI thread) ------------------------
     def set_status(self, text):
-        self.SetStatusText(text)
+        self._status = text
+        if not self._busy:
+            self.SetStatusText(text)
+
+    def set_busy(self, busy):
+        """KiCad refuses API calls while an interactive tool is running."""
+        self._busy = busy
+        self.SetStatusText("KiCad is busy (a tool is active) - updates resume when you "
+                           "leave the tool (Esc)" if busy else self._status)
+
+    def set_outline(self, rings, chains):
+        self._view.set_outline(rings, chains)
 
     def show_message(self, text):
         self._geometry = self._field = self._composite = None
-        self._view.set_image(None, message=text)
+        self._view.set_message(text)
         self._info.SetLabel(text)
 
     def show_result(self, geometry, field, final, seconds):
@@ -305,7 +466,7 @@ class IsoplotFrame(wx.Frame):
         if geometry.unfilled_zones:
             status += ("    %d zone(s) unfilled - press B in KiCad to fill"
                        % geometry.unfilled_zones)
-        self.SetStatusText(status)
+        self.set_status(status)
 
     def raise_window(self):
         if self.IsIconized():
@@ -321,38 +482,26 @@ class IsoplotFrame(wx.Frame):
         layers = [li for (li, cb) in self._checks if cb.GetValue()]
         if not layers:
             self._composite = None
-            self._view.set_image(None, message="No layers selected")
+            self._view.set_message("No layers selected")
             return
         if field.max_distance_nm <= 0.0:
             self._composite = None
-            self._view.set_image(None, message=(
+            self._view.set_message(
                 "The net has only the selected copper (nothing to measure).\n"
-                "If it clearly has more copper, fill its zones (press B)."))
+                "If it clearly has more copper, fill its zones (press B).")
             return
         self._composite = field.dist[layers].min(axis=0)
         img = heatmap_image(self._composite, field.max_distance_nm)
         if img is None:
-            self._view.set_image(None, message="No copper on these layers")
+            self._view.set_message("No copper on these layers")
             return
-        self._view.set_image(img, self._seed_shapes())
+        self._view.set_heatmap(img, field.origin, field.pitch_nm, self._seed_shapes())
 
     def _seed_shapes(self):
-        """Seed copper in image coordinates (cell (0,0) spans 0..1)."""
-        f = self._field
-        ox, oy = f.origin
-        pitch = float(f.pitch_nm)
-
-        def g(x, y):
-            return ((x - ox) / pitch + 0.5, (y - oy) / pitch + 0.5)
-
-        out = []
+        """Seed copper outlines in board coordinates (nm)."""
         prims = self._geometry.prims
-        for (_, x, y, r) in prims.seed_discs:
-            gx, gy = g(x, y)
-            out.append(("disc", gx, gy, r / pitch))
-        for (_, rings) in prims.seed_polys:
-            if rings:
-                out.append(("poly", [g(x, y) for (x, y) in rings[0]]))
+        out = [("disc", x, y, r) for (_, x, y, r) in prims.seed_discs]
+        out += [("poly", rings[0]) for (_, rings) in prims.seed_polys if rings]
         return out
 
     # -- events -------------------------------------------------------------
@@ -373,15 +522,19 @@ class IsoplotFrame(wx.Frame):
             style &= ~wx.STAY_ON_TOP
         self.SetWindowStyleFlag(style)
 
-    def _on_motion(self, pos):
-        cell = self._view.cell_at(pos) if pos is not None else None
-        if cell is None or self._composite is None:
+    def _on_motion(self, world):
+        if world is None:
             self._cursor.SetLabel("Cursor: -")
             return
-        ix, iy = cell
-        x, y = self._field.cell_center_world(ix, iy)
+        x, y = world
         where = "(x %.2f, y %.2f mm)" % (x / MM, y / MM)
-        v = self._composite[iy, ix]
+        f = self._field
+        v = np.inf
+        if f is not None and self._composite is not None:
+            ix = int(round((x - f.origin[0]) / f.pitch_nm))
+            iy = int(round((y - f.origin[1]) / f.pitch_nm))
+            if 0 <= ix < f.nx and 0 <= iy < f.ny:
+                v = self._composite[iy, ix]
         if np.isfinite(v):
             self._cursor.SetLabel("Cursor: %.2f mm from selection   %s" % (v / MM, where))
         else:

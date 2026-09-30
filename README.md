@@ -15,7 +15,15 @@ The window stays open beside KiCad and keeps up with your work:
 - **Edit the board** (move, route, delete, undo, refill zones) and it
   recomputes. A coarse result appears within a moment and is then refined.
 - Select **several pads/vias on one net** to measure from all of them at once.
+- The view is framed by the **board outline** (Edge.Cuts), so it doesn't jump
+  between nets. The mouse wheel zooms, dragging pans, and a double-click shows
+  the whole board. The outline is read once. After editing it, press **Update
+  Board Outline**.
 - The cursor readout gives the distance and board coordinates under the mouse.
+
+While an interactive tool is active in KiCad (routing, placing a via,
+dragging...), KiCad answers every API request with "busy". The window says so
+and catches up as soon as you leave the tool (Esc).
 
 ## Requirements
 

@@ -31,6 +31,7 @@ log = logging.getLogger(__name__)
 
 SELECTION_POLL_S = 0.25
 MIN_GEOMETRY_POLL_S = 1.0
+BUSY_NOTICE_S = 0.5            # report "KiCad is busy" after this long
 GIVE_UP_AFTER_S = 30.0          # close once KiCad has been unreachable this long
 API_TIMEOUT_MS = 3000
 
@@ -55,6 +56,7 @@ class LiveSession:
         self._follow = True
         self._adopt = False      # take the current selection even when pinned
         self._force = False      # re-read and re-solve even if unchanged
+        self._outline_request = False
         self._wake = threading.Event()
         self._stop = threading.Event()
         self._solver = _Solver(self._post)
@@ -80,6 +82,10 @@ class LiveSession:
         self._adopt = self._adopt or adopt_selection
         self._wake.set()
 
+    def refresh_outline(self):
+        self._outline_request = True
+        self._wake.set()
+
     def _post(self, method, *args):
         wx.CallAfter(_call_if_alive, self._frame, method, args)
 
@@ -90,7 +96,10 @@ class LiveSession:
         seed_ids = ()
         last_fp = None
         next_geometry = 0.0
+        outline_fp = None
         unreachable_since = None
+        busy_since = None
+        busy_shown = False
         last_status = None
 
         def status(text):
@@ -106,10 +115,19 @@ class LiveSession:
                     kicad = KiCad(client_name="net-isoplot", timeout_ms=API_TIMEOUT_MS)
                 if reader is None:
                     reader = ks.BoardReader(kicad.get_board())
-                    seed_ids, last_fp = (), None
+                    seed_ids, last_fp, outline_fp = (), None, None
                     log.info("attached to board %s", reader.name)
                     status("Connected to %s" % reader.name)
                 unreachable_since = None
+
+                # The outline is read when attaching to a board and on request
+                # ("Update Board Outline"), not polled.
+                if outline_fp is None or self._outline_request:
+                    fp, rings, chains = reader.board_outline()
+                    self._outline_request = False
+                    if fp != outline_fp:
+                        outline_fp = fp
+                        self._post("set_outline", rings, chains)
 
                 force, self._force = self._force, False
                 adopt, self._adopt = self._adopt, False
@@ -133,6 +151,10 @@ class LiveSession:
                         last_fp = geometry.fingerprint
                         last_status = None
                         self._solver.submit(geometry)
+                busy_since = None
+                if busy_shown:
+                    busy_shown = False
+                    self._post("set_busy", False)
             except ks.SeedError as e:
                 seed_ids, last_fp = (), None
                 status("%s Select a pad or via." % e)
@@ -146,7 +168,14 @@ class LiveSession:
                     self._post("Close")
                     return
             except ApiError as e:
-                if not ks.is_busy(e):
+                if ks.is_busy(e):
+                    # An interactive tool (routing, via placement, drag...) is
+                    # active; KiCad refuses all API calls until it ends.
+                    busy_since = busy_since or now
+                    if not busy_shown and now - busy_since >= BUSY_NOTICE_S:
+                        busy_shown = True
+                        self._post("set_busy", True)
+                else:
                     # No board open, the board was closed/replaced, or a stale
                     # document: start over with a fresh board handle.
                     log.info("API error: %s", e)

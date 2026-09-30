@@ -17,9 +17,10 @@ from __future__ import annotations
 import hashlib
 import math
 
-from kipy.board_types import ArcTrack, Pad, Track, Via, Zone
+from kipy.board_types import (ArcTrack, BoardArc, BoardBezier, BoardCircle, BoardPolygon,
+                              BoardRectangle, BoardSegment, Pad, Track, Via, Zone)
 from kipy.errors import ApiError
-from kipy.proto.board.board_types_pb2 import PadStackType, ZoneType
+from kipy.proto.board.board_types_pb2 import BoardLayer, PadStackType, ZoneType
 from kipy.proto.common import ApiStatusCode
 from kipy.proto.common.types import KiCadObjectType
 from kipy.util.board_layer import canonical_name, iter_copper_layers
@@ -87,6 +88,19 @@ class BoardReader:
         """IDs of the pads/vias currently selected in the PCB editor."""
         items = self.board.get_selection(_SEED_TYPES)
         return tuple(sorted(i.id.value for i in items if isinstance(i, (Pad, Via))))
+
+    def board_outline(self):
+        """The board's Edge.Cuts as (fingerprint, closed rings, open chains).
+
+        Board-level shapes only; Edge.Cuts drawn inside footprints (e.g. slots)
+        are not included.
+        """
+        shapes = [s for s in self.board.get_shapes() if s.layer == BoardLayer.BL_Edge_Cuts]
+        h = hashlib.blake2b(digest_size=16)
+        for s in shapes:
+            h.update(s.proto.SerializeToString(deterministic=True))
+        rings, chains = _chain([pl for s in shapes for pl in _shape_polylines(s)])
+        return h.hexdigest(), rings, chains
 
     def fetch(self, seed_ids, previous_fingerprint=None):
         """Return the NetGeometry for the net of ``seed_ids``, or None if the
@@ -299,6 +313,74 @@ def _sample_arc(start, mid, end, max_seg_nm):
     n = max(2, int(abs(sweep) * r / max(1.0, max_seg_nm)) + 1)
     return [(ux + r * math.cos(a1 + sweep * i / n), uy + r * math.sin(a1 + sweep * i / n))
             for i in range(n + 1)]
+
+
+def _shape_polylines(shape):
+    """A board graphic shape as a list of polylines ((x, y) lists, nm)."""
+    if isinstance(shape, BoardSegment):
+        return [[(shape.start.x, shape.start.y), (shape.end.x, shape.end.y)]]
+    if isinstance(shape, BoardArc):
+        return [_sample_arc((shape.start.x, shape.start.y), (shape.mid.x, shape.mid.y),
+                            (shape.end.x, shape.end.y), _ARC_SEG_NM)]
+    if isinstance(shape, BoardCircle):
+        c, r = shape.center, shape.radius()
+        n = 72
+        return [[(c.x + r * math.cos(2 * math.pi * i / n), c.y + r * math.sin(2 * math.pi * i / n))
+                 for i in range(n + 1)]]
+    if isinstance(shape, BoardRectangle):
+        (x0, y0), (x1, y1) = (shape.top_left.x, shape.top_left.y), \
+            (shape.bottom_right.x, shape.bottom_right.y)
+        return [[(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)]]
+    if isinstance(shape, BoardPolygon):
+        return [ring + ring[:1] for poly in shape.polygons for ring in _rings(poly) if ring]
+    if isinstance(shape, BoardBezier):
+        p = [(v.x, v.y) for v in (shape.start, shape.control1, shape.control2, shape.end)]
+        n = 24
+        pts = []
+        for i in range(n + 1):
+            t = i / n
+            a, b, c, d = (1 - t) ** 3, 3 * t * (1 - t) ** 2, 3 * t * t * (1 - t), t ** 3
+            pts.append((a * p[0][0] + b * p[1][0] + c * p[2][0] + d * p[3][0],
+                        a * p[0][1] + b * p[1][1] + c * p[2][1] + d * p[3][1]))
+        return [pts]
+    return []
+
+
+def _chain(polylines, tol=1_000):
+    """Join polylines that share endpoints (within ``tol`` nm).
+
+    Returns (closed rings, open chains); outlines drawn as separate segments
+    and arcs become closed rings the viewer can fill.
+    """
+    def close(a, b):
+        return abs(a[0] - b[0]) <= tol and abs(a[1] - b[1]) <= tol
+
+    pending = [list(pl) for pl in polylines if len(pl) >= 2]
+    rings, chains = [], []
+    while pending:
+        chain = pending.pop()
+        grown = True
+        while grown and not (len(chain) > 3 and close(chain[0], chain[-1])):
+            grown = False
+            for i, pl in enumerate(pending):
+                if close(chain[-1], pl[0]):
+                    chain = chain + pl[1:]
+                elif close(chain[-1], pl[-1]):
+                    chain = chain + pl[-2::-1]
+                elif close(chain[0], pl[-1]):
+                    chain = pl[:-1] + chain
+                elif close(chain[0], pl[0]):
+                    chain = pl[:0:-1] + chain
+                else:
+                    continue
+                pending.pop(i)
+                grown = True
+                break
+        if len(chain) > 3 and close(chain[0], chain[-1]):
+            rings.append(chain)
+        else:
+            chains.append(chain)
+    return rings, chains
 
 
 def _bbox(prims):
