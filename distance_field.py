@@ -4,19 +4,24 @@ This module has **no dependency on KiCad**. It takes plain numeric primitives
 (all coordinates in KiCad internal units = nanometres), rasterises the copper
 of a single net onto a multi-layer grid, and computes the geodesic
 (along-copper) distance from the seed copper to every reachable copper cell
-using a multi-source Dijkstra.
+as a multi-source shortest path over 16 moves per cell (the 8 neighbours plus
+knight's moves), which keeps a grid path within ~2.8 % of the true length.
 
 Keeping this module KiCad-free means the heavy logic can be unit tested with
 synthetic input, and it can run on a worker thread without touching the API.
 
-Rasterisation is vectorised with NumPy. The Dijkstra itself is a tight
-pure-Python loop over flat lists (NumPy has no fast priority queue); it checks a
-``cancel`` callback periodically so a stale solve can be abandoned when the
-board or the selection changes.
+Rasterisation is vectorised with NumPy. The shortest-path search switches
+between two strategies over the same distance buffer: while the wavefront is
+wide (pours) NumPy passes over a band of the frontier do the work
+(delta-stepping), and while it is narrow
+(thin traces) a tight pure-Python heap loop does, since there NumPy's per-call
+overhead would dominate. Both check a ``cancel`` callback periodically so a
+stale solve can be abandoned when the board or the selection changes.
 """
 
 from __future__ import annotations
 
+import array
 import heapq
 import math
 
@@ -103,6 +108,21 @@ def _grid_dims(bbox, pitch_nm, margin_nm):
     nx = max(1, int(math.ceil((xmax - xmin) / pitch_nm)) + 1)
     ny = max(1, int(math.ceil((ymax - ymin) / pitch_nm)) + 1)
     return nx, ny, (xmin, ymin)
+
+
+def copper_area(prims):
+    """Rough copper area of a net in nm^2 (overlaps count twice), for sizing
+    decisions before rasterising."""
+    area = sum(math.hypot(x1 - x0, y1 - y0) * w for (_, x0, y0, x1, y1, w) in prims.segments)
+    area += sum(math.pi * r * r for (_, _, _, r) in prims.discs)
+    for _, rings in prims.polys:
+        for i, ring in enumerate(rings):
+            if len(ring) >= 3:
+                a = np.asarray(ring, dtype=np.float64)
+                x, y = a[:, 0], a[:, 1]
+                shoelace = abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))) / 2
+                area += shoelace if i == 0 else -shoelace   # outline, then holes
+    return area
 
 
 def pitch_for_budget(bbox, num_layers, max_cells, min_pitch_nm):
@@ -286,11 +306,24 @@ def build_masks(prims, pitch_nm, margin_nm):
 # Solve
 # ---------------------------------------------------------------------------
 
-def solve(prims, pitch_nm, margin_nm=None, cancel=None):
-    """Rasterise + multi-source Dijkstra. Returns a DistanceField.
+# Pending-cell counts at which the search changes strategy. Below TO_HEAP a
+# NumPy pass costs more in call overhead than the heap spends on the cells;
+# above TO_VECTOR the heap is the slower one. The gap stops it flapping.
+# (Measured on real nets: a pass costs about as much as ~30 heap pops.)
+TO_HEAP = 16
+TO_VECTOR = 64
+# Width (in cells) of the distance band a NumPy pass relaxes at once.
+DELTA_CELLS = 2.0
+
+
+def solve(prims, pitch_nm, margin_nm=None, cancel=None,
+          to_heap=TO_HEAP, to_vector=TO_VECTOR, delta_cells=DELTA_CELLS):
+    """Rasterise + multi-source shortest paths. Returns a DistanceField.
 
     ``cancel`` is an optional zero-argument callable polled during the solve;
     when it returns True the solve stops by raising :class:`Cancelled`.
+    ``to_heap`` / ``to_vector`` / ``delta_cells`` only tune the speed of the
+    search (see TO_HEAP, DELTA_CELLS); the result does not depend on them.
     """
     if margin_nm is None:
         margin_nm = 2 * pitch_nm
@@ -322,52 +355,201 @@ def solve(prims, pitch_nm, margin_nm=None, cancel=None):
             masks[li, c[1], c[0]] = True
         via_cells.append((c[0], c[1], layers))
 
-    # Pad the grid by one empty cell on every side so the in-plane neighbour
-    # step never needs a bounds check (and never wraps into another layer).
-    nxp, nyp = nx + 2, ny + 2
+    # Pad the grid by two empty cells on every side so no move (they reach two
+    # cells away) needs a bounds check or wraps into another row or layer.
+    nxp, nyp = nx + 2 * _PAD, ny + 2 * _PAD
     stride = nxp * nyp
     padded = np.zeros((L, nyp, nxp), dtype=bool)
-    padded[:, 1:-1, 1:-1] = masks
-    mask = padded.reshape(-1).tobytes()
+    padded[:, _PAD:-_PAD, _PAD:-_PAD] = masks
 
     def gidx(li, ix, iy):
-        return li * stride + (iy + 1) * nxp + (ix + 1)
+        return li * stride + (iy + _PAD) * nxp + (ix + _PAD)
 
-    links = {}  # global cell -> other-layer cells joined by a via/PTH
-    for (ix, iy, layers) in via_cells:
-        cells = [gidx(li, ix, iy) for li in layers]
+    groups = [[gidx(li, ix, iy) for li in layers] for (ix, iy, layers) in via_cells]
+    li_s, iy_s, ix_s = np.nonzero(seed_masks)
+    seeds = gidx(li_s, ix_s, iy_s)
+
+    steps, allow = _moves(padded, float(pitch_nm))
+    dist = _search(allow, seeds, steps, groups, cancel, to_heap, to_vector,
+                   delta_cells * pitch_nm)
+    arr = dist.reshape(L, nyp, nxp)[:, _PAD:-_PAD, _PAD:-_PAD]
+    return DistanceField(nx, ny, L, pitch_nm, origin, np.ascontiguousarray(arr))
+
+
+_PAD = 2
+
+# The 16 moves (dx, dy): the 8 neighbours, then the 8 knight's moves. Adding
+# knight's moves cuts the worst-case overestimate of a grid path from 8.2 %
+# to 2.8 % (the largest angle between two move directions drops from 45 to
+# 26.6 degrees). A knight's move crosses two cells beside its line, and is
+# only allowed when both are copper, so it never jumps across a gap.
+_MOVES = [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (-1, 1), (1, -1), (-1, -1),
+          (2, 1), (2, -1), (-2, 1), (-2, -1), (1, 2), (-1, 2), (1, -2), (-1, -2)]
+
+
+def _crossed(dx, dy):
+    """Cells a knight's move passes through besides its end points."""
+    if abs(dx) == 2:
+        sx = dx // 2
+        return ((sx, 0), (sx, dy))
+    sy = dy // 2
+    return ((0, sy), (dx, sy))
+
+
+def _moves(padded, pitch):
+    """Moves as (flat offset, length) plus, per cell of the flattened
+    ``padded`` grid, a uint16 whose bit k is set when move k from that copper
+    cell stays on copper."""
+    _, nyp, nxp = padded.shape
+    steps = [(dy * nxp + dx, pitch * math.hypot(dx, dy)) for dx, dy in _MOVES]
+    flat = padded.reshape(-1)
+    copper = np.flatnonzero(flat)
+    allow = np.zeros(padded.shape, dtype=np.uint16)
+    P = _PAD
+    if copper.size * 4 < flat.size:
+        # Sparse copper (a net spread thinly over its bounding box): look up
+        # the neighbours of the copper cells only.
+        ok = np.empty((len(_MOVES), copper.size), dtype=bool)
+
+        def on(dx, dy):
+            return flat[copper + (dy * nxp + dx)]
+    else:
+        # Dense copper: shifted views of the whole grid are faster.
+        inner = padded[:, P:nyp - P, P:nxp - P]
+        ok = np.empty((len(_MOVES),) + inner.shape, dtype=bool)
+
+        def on(dx, dy):
+            return padded[:, P + dy:nyp - P + dy, P + dx:nxp - P + dx]
+    for k, (dx, dy) in enumerate(_MOVES):
+        ok[k] = on(dx, dy)
+        if abs(dx) + abs(dy) == 3:
+            for cx, cy in _crossed(dx, dy):
+                ok[k] &= on(cx, cy)
+    packed = np.packbits(ok, axis=0, bitorder="little")   # 2 bytes per cell
+    bits = packed[0] | packed[1].astype(np.uint16) << 8
+    if ok.ndim == 2:
+        allow.reshape(-1)[copper] = bits
+    else:
+        allow[:, P:nyp - P, P:nxp - P] = bits * inner    # moves only from copper
+    return steps, allow.reshape(-1)
+
+
+def _search(allow_np, seeds, steps, groups, cancel, to_heap, to_vector, delta):
+    """Shortest distances over the flat padded grid from ``seeds`` (distance 0).
+
+    ``allow_np`` holds each cell's allowed moves (see _moves). ``groups`` lists
+    cells joined at zero cost (a via or plated hole across its layers).
+    Label-correcting: every cell whose distance dropped stays pending until its
+    moves have been relaxed, so the result is exact whichever strategy handled
+    which part. The heap loop works on Python ``array`` objects (fast scalar
+    access); the NumPy passes on views of the same data.
+    """
+    n = allow_np.size
+    dist = array.array("d", [math.inf]) * n
+    dist_np = np.frombuffer(dist, dtype=np.float64)
+    dist_np[seeds] = 0.0
+    allow = array.array("H")
+    allow.frombytes(allow_np.tobytes())
+    # Per 8-bit half of the move mask, the moves it enables (heap loop).
+    near = [tuple(steps[k] for k in range(8) if v >> k & 1) for v in range(256)]
+    knight = [tuple(steps[8 + k] for k in range(8) if v >> k & 1) for v in range(256)]
+    moves = (np.array([s for s, _ in steps], dtype=np.int64),   # NumPy passes
+             np.array([c for _, c in steps], dtype=np.float64))
+
+    links = {}  # cell -> other-layer cells of its via (heap loop)
+    for cells in groups:
         for g in cells:
             links.setdefault(g, set()).update(h for h in cells if h != g)
+    via_cells = np.array([g for cells in groups for g in cells], dtype=np.int64)
+    via_group = np.repeat(np.arange(len(groups)), [len(c) for c in groups])
 
-    ortho = float(pitch_nm)
-    diag = float(pitch_nm) * math.sqrt(2.0)
-    steps = ((1, ortho), (-1, ortho), (nxp, ortho), (-nxp, ortho),
-             (nxp + 1, diag), (nxp - 1, diag), (-nxp + 1, diag), (-nxp - 1, diag))
+    pending = np.unique(seeds.astype(np.int64))
+    heap = None
+    if pending.size < to_heap:
+        heap = [(0.0, g) for g in pending.tolist()]
+        heapq.heapify(heap)
 
-    INF = math.inf
-    dist = [INF] * (L * stride)
-    li_s, iy_s, ix_s = np.nonzero(seed_masks)
-    heap = []
-    for li, iy, ix in zip(li_s.tolist(), iy_s.tolist(), ix_s.tolist()):
-        g = gidx(li, ix, iy)
-        dist[g] = 0.0
-        heap.append((0.0, g))
-    heapq.heapify(heap)
+    slot = np.empty(n, dtype=np.int32)  # scratch for de-duplicating cells
+    passes = 0
+    while True:
+        if heap is not None:
+            if not _heap_run(heap, dist, allow, near, knight, links.get, to_vector, cancel):
+                break  # heap drained: done
+            pending = np.unique(np.fromiter(
+                (g for d, g in heap if d == dist[g]), dtype=np.int64))
+            heap = None
+        if not pending.size:
+            break
+        if pending.size < to_heap:
+            heap = [(dist[g], g) for g in pending.tolist()]
+            heapq.heapify(heap)
+            continue
+        passes += 1
+        if cancel is not None and not passes & 0xF and cancel():
+            raise Cancelled()
+        # Delta-stepping: relax only the pending cells within ``delta`` of the
+        # nearest one, so cells settle roughly in distance order. Relaxing all
+        # of them would let long moves race ahead, and cells far from the
+        # seed would then be improved over and over.
+        d = dist_np[pending]
+        now = d < d.min() + delta
+        improved = _wave_pass(pending[now], dist_np, allow_np, moves,
+                              via_cells, via_group, len(groups))
+        pending = _unique(np.concatenate([pending[~now], improved]), slot)
+    return dist_np
 
+
+def _unique(cells, slot):
+    """``cells`` without duplicates, without sorting: each cell keeps the last
+    position that wrote to it in ``slot`` (scratch the size of the grid)."""
+    order = np.arange(cells.size, dtype=np.int32)
+    slot[cells] = order
+    return cells[slot[cells] == order]
+
+
+# Move mask -> the 16 flags, for the NumPy passes (1 MB).
+_FLAGS = ((np.arange(1 << 16, dtype=np.uint32)[:, None]
+           >> np.arange(len(_MOVES), dtype=np.uint32)) & 1).astype(bool)
+
+
+def _wave_pass(active, dist, allow, moves, via_cells, via_group, n_groups):
+    """Relax every allowed move of every given cell at once (as one cells x
+    moves array, so a pass costs a handful of NumPy calls); returns the cells
+    whose distance dropped (may contain duplicates)."""
+    offsets, lengths = moves
+    on = _FLAGS[allow[active]]
+    hit = (active[:, None] + offsets)[on]
+    nd = (dist[active][:, None] + lengths)[on]
+    better = nd < dist[hit]
+    hit = hit[better]
+    np.minimum.at(dist, hit, nd[better])
+    if n_groups:
+        best = np.full(n_groups, np.inf)
+        np.minimum.at(best, via_group, dist[via_cells])
+        joined = best[via_group]
+        lower = joined < dist[via_cells]
+        if lower.any():
+            dist[via_cells[lower]] = joined[lower]
+            hit = np.concatenate([hit, via_cells[lower]])
+    return hit
+
+
+def _heap_run(heap, dist, allow, near, knight, get_links, to_vector, cancel):
+    """Dijkstra-style loop on ``heap`` until it drains (returns False) or grows
+    past ``to_vector`` entries (returns True, heap still holds the pending
+    cells). ``near``/``knight`` map the low/high byte of a cell's move mask to
+    its allowed (offset, length) moves."""
     pop = heapq.heappop
     push = heapq.heappush
-    get_links = links.get
     popped = 0
     while heap:
         d, g = pop(heap)
         if d > dist[g]:
             continue
-        popped += 1
-        if cancel is not None and not popped & 0x3FFF and cancel():
-            raise Cancelled()
-        for step, cost in steps:
-            h = g + step
-            if mask[h]:
+        bits = allow[g]
+        for moves in (near[bits & 0xFF], knight[bits >> 8]):
+            for step, cost in moves:
+                h = g + step
                 nd = d + cost
                 if nd < dist[h]:
                     dist[h] = nd
@@ -378,6 +560,10 @@ def solve(prims, pitch_nm, margin_nm=None, cancel=None):
                 if d < dist[h]:
                     dist[h] = d
                     push(heap, (d, h))
-
-    arr = np.array(dist, dtype=np.float64).reshape(L, nyp, nxp)[:, 1:-1, 1:-1]
-    return DistanceField(nx, ny, L, pitch_nm, origin, np.ascontiguousarray(arr))
+        popped += 1
+        if not popped & 0xFF:
+            if len(heap) > to_vector:
+                return True
+            if cancel is not None and not popped & 0x3FFF and cancel():
+                raise Cancelled()
+    return False

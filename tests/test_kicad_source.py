@@ -183,6 +183,110 @@ def test_seed_errors():
         raise AssertionError("unconnected seed not reported")
 
 
+class FakeBoardV10(FakeBoard):
+    """KiCad 10.0.1+: per-item and per-net queries; the whole-board read
+    must not be used."""
+
+    def __init__(self, items, selection=(), refuse=None):
+        super().__init__(items, selection)
+        self.refuse = refuse     # ApiStatusCode to answer the new queries with
+
+    def get_items(self, types):
+        self.calls.append("get_items")
+        return super().get_items(types)
+
+    def get_items_by_id(self, ids):
+        self.calls.append("get_items_by_id")
+        if self.refuse is not None:
+            raise ApiError("refused", code=self.refuse)
+        wanted = {k.value for k in ids}
+        return [i for i in self.items if i.id.value in wanted]
+
+    def get_items_by_net(self, net, types):
+        self.calls.append("get_items_by_net")
+        return [i for i in self.items if ks._net_name(i) == net.name]
+
+
+def _same_geometry(a, b):
+    for attr in ("num_layers", "bbox", "segments", "discs", "vias", "sources",
+                 "seed_discs", "seed_polys", "polys"):
+        assert getattr(a.prims, attr) == getattr(b.prims, attr), attr
+    assert (a.net_name, a.layer_names, a.seed_count, a.unfilled_zones) == \
+        (b.net_name, b.layer_names, b.seed_count, b.unfilled_zones)
+
+
+def test_per_net_query_matches_whole_board_read():
+    """KiCad 10: only the seed net is fetched, and the result is the same."""
+    old = ks.BoardReader(board_fixture()).fetch(("pad1",))
+    board = FakeBoardV10(board_fixture().items, selection=("pad1",))
+    reader = ks.BoardReader(board)
+    new = reader.fetch(("pad1",))
+    _same_geometry(old, new)
+    assert "get_items" not in board.calls and "get_items_by_net" in board.calls
+    assert reader.fetch(("pad1",), new.fingerprint) is None      # unchanged board
+
+
+def test_falls_back_on_kicad_9():
+    """KiCad 9 answers the new queries with AS_UNHANDLED: whole-board read,
+    same result, and the new queries are not tried again."""
+    old = ks.BoardReader(board_fixture()).fetch(("pad1",))
+    board = FakeBoardV10(board_fixture().items, selection=("pad1",),
+                         refuse=ApiStatusCode.AS_UNHANDLED)
+    reader = ks.BoardReader(board)
+    _same_geometry(old, reader.fetch(("pad1",)))
+    reader.fetch(("pad1",))
+    assert board.calls.count("get_items_by_id") == 1, board.calls
+    assert board.calls.count("get_items") == 2, board.calls
+
+
+def test_features_from_version():
+    f9 = ks.KiCadFeatures((9, 0, 5))
+    assert f9.padstack_presence and not f9.layer_names and not f9.net_queries
+    assert ks.KiCadFeatures((9, 0, 8)).layer_names
+    assert not ks.KiCadFeatures((10, 0, 0)).net_queries
+    f10 = ks.KiCadFeatures((10, 0, 1))
+    assert f10.net_queries and f10.layer_names
+    unknown = ks.KiCadFeatures()
+    assert unknown.net_queries and unknown.layer_names, "unknown version: try everything"
+    assert "9.0.5" in str(f9)
+
+
+def test_version_decides_before_any_request():
+    """On KiCad 9 the per-net query and layer-name calls are never sent, and
+    the result equals the whole-board read."""
+    board = FakeBoardV10(board_fixture().items, selection=("pad1",))
+    board.get_layer_name = lambda lid: (_ for _ in ()).throw(AssertionError("layer name asked"))
+    reader = ks.BoardReader(board, ks.KiCadFeatures((9, 0, 5)))
+    _same_geometry(ks.BoardReader(board_fixture()).fetch(("pad1",)), reader.fetch(("pad1",)))
+    assert "get_items_by_id" not in board.calls and "get_items_by_net" not in board.calls
+    # ... and on 10.0.1 the per-net query is used straight away.
+    board = FakeBoardV10(board_fixture().items, selection=("pad1",))
+    ks.BoardReader(board, ks.KiCadFeatures((10, 0, 1))).fetch(("pad1",))
+    assert "get_items" not in board.calls and "get_items_by_net" in board.calls
+
+
+def test_per_net_query_busy_and_seed_errors():
+    board = FakeBoardV10(board_fixture().items, refuse=ApiStatusCode.AS_BUSY)
+    reader = ks.BoardReader(board)
+    try:
+        reader.fetch(("pad1",))
+    except ApiError as e:
+        assert ks.is_busy(e)
+    else:
+        raise AssertionError("busy KiCad not reported")
+    assert reader._have_net_queries, "a busy KiCad must not disable the per-net query"
+
+    reader = ks.BoardReader(FakeBoardV10(board_fixture().items))
+    for seeds in (("gone",), ("nc",)):
+        reader.board.items.append(smd_pad("nc", "", 0, 0))
+        try:
+            reader.fetch(seeds)
+        except ks.SeedError:
+            pass
+        else:
+            raise AssertionError("seed error not reported for %r" % (seeds,))
+
+
 def test_via_diameter_front_inner_back():
     v = via("v", "N", 0, 0)
     ps = v.proto.pad_stack

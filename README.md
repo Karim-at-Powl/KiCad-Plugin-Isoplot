@@ -55,10 +55,10 @@ Each module has a single job, and only one of them talks to KiCad:
 | File | Role |
 | --- | --- |
 | `isoplot.py` | Entry point KiCad launches (`plugin.json`). Single-instance handling, logging, starts the window. |
-| `live.py` | Background threads. The **poller** reads the selection 4×/s and re-reads the seed net about once a second. The IPC API has no change events, so a fingerprint of the net's items skips unchanged boards. The **solver** runs a coarse pass, then a fine one; a newer job cancels the current one. |
-| `kicad_source.py` | The only module that uses the KiCad API (`kipy`). It fetches the net's tracks, arcs, vias, pads (exact per-layer polygons from KiCad) and filled zones, and honours unconnected-layer removal. Output is plain primitives in nm. |
-| `distance_field.py` | KiCad-free core. Rasterises copper onto a multi-layer grid (NumPy) and runs a multi-source Dijkstra from the seed copper. |
-| `viewer.py` | The wxPython window: heatmap, legend, layer toggles, cursor readout. |
+| `live.py` | Background threads. The **poller** reads the selection 10×/s and re-reads the seed net about once a second. The IPC API has no change events, so a fingerprint of the net's items skips unchanged boards. The **solver** runs a coarse pass, then a fine one (small nets go straight to the fine one); a newer job cancels the current one. |
+| `kicad_source.py` | The only module that uses the KiCad API (`kipy`). It fetches the net's tracks, arcs, vias, pads (exact per-layer polygons from KiCad) and filled zones, and honours unconnected-layer removal. It reads KiCad's version once per connection and derives the API features to use (`KiCadFeatures`): on KiCad 10.0.1+ it asks for just the seed net's items, older versions read the whole board. Output is plain primitives in nm. |
+| `distance_field.py` | KiCad-free core. Rasterises copper onto a multi-layer grid (NumPy) and finds shortest paths from the seed copper: NumPy passes across pours, a heap-based Dijkstra loop along thin traces. |
+| `viewer.py` | The wxPython window: heatmap, legend, layer toggles, cursor readout. The heatmap is rendered at screen resolution: copper edges come from the exact shapes (anti-aliased), and the colour comes from the distance grid, interpolated between cells. Where layers overlap, the one nearer the seed shows. |
 
 > **Why a separate window and not an on-canvas overlay?** Neither KiCad API
 > (SWIG in v9, IPC in v9–v11) can put pixel data onto the board canvas, so the
@@ -69,6 +69,7 @@ Each module has a single job, and only one of them talks to KiCad:
 ```
 python tests/test_distance_field.py     # no dependencies beyond NumPy
 python tests/test_kicad_source.py       # needs kicad-python (no KiCad required)
+python tests/test_viewer.py             # needs wxPython (KiCad's bundled Python)
 ```
 
 ## Troubleshooting
@@ -80,9 +81,10 @@ zones (press **B**). Unfilled zones are reported in the status bar.
 
 ## Notes / limitations
 
-- Distance is an **8-connected grid geodesic**: slightly long, by up to about 8%
-  on diagonal-ish paths. Grid pitch adapts to the net's size: 0.05 mm on
-  small nets, coarser on large pours.
+- Distance is a **grid geodesic** with 16 moves per cell (neighbours plus
+  knight's moves): slightly long, by up to about 2.8% depending on direction
+  (about 1% on average across a pour). Grid pitch adapts to the net's size:
+  0.05 mm on small nets, coarser on large pours.
 - Distances are measured from the edge of the selected copper, and via/hole
   transitions count as zero length.
 - Zone copper is only as current as the last zone fill.

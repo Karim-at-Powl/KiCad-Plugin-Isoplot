@@ -83,6 +83,80 @@ def test_seed_polygon_measures_from_pad_edge():
     assert 17.5 < f.max_distance_nm / MM < 18.5, f.max_distance_nm / MM
 
 
+def test_search_strategies_agree():
+    """Heap-only, wavefront-only and the default mix give identical fields on
+    a net with a pour, a hole, thin traces and a via."""
+    p = df.NetPrimitives()
+    p.num_layers = 2
+    p.polys = [(0, [square(0, 0, 12 * MM), square(3 * MM, 3 * MM, 5 * MM)])]
+    p.segments = [(0, 12 * MM, 6 * MM, 30 * MM, 6 * MM, int(0.2 * MM)),
+                  (1, 30 * MM, 6 * MM, 30 * MM, 20 * MM, int(0.3 * MM)),
+                  (1, 30 * MM, 20 * MM, 5 * MM, 20 * MM, int(0.3 * MM))]
+    p.vias = [(30 * MM, 6 * MM, [0, 1])]
+    p.seed_discs = [(0, 1 * MM, 1 * MM, int(0.4 * MM))]
+    p.bbox = (0, 0, 31 * MM, 21 * MM)
+    pitch = int(0.1 * MM)
+    ref = df.solve(p, pitch, to_heap=10 ** 9, to_vector=10 ** 9).dist
+    for th, tv in ((0, 0), (df.TO_HEAP, df.TO_VECTOR), (4, 8)):
+        got = df.solve(p, pitch, to_heap=th, to_vector=tv).dist
+        assert np.array_equal(np.isfinite(ref), np.isfinite(got)), (th, tv)
+        fin = np.isfinite(ref)
+        assert np.allclose(ref[fin], got[fin], rtol=0, atol=1e-6), (th, tv)
+    assert np.isfinite(ref[1]).sum() > 100, "via did not bridge to layer 1"
+
+
+def test_accuracy_against_exact_distances():
+    """With knight's moves the grid path overestimates by at most ~2.8 %:
+    straight traces at awkward angles, and an open pour around a round pad."""
+    pitch = int(0.05 * MM)
+    for deg in (10, 22.5, 30):
+        a = math.radians(deg)
+        x1, y1 = 30 * MM * math.cos(a), 30 * MM * math.sin(a)
+        p = df.NetPrimitives()
+        p.num_layers = 1
+        p.segments = [(0, 0, 0, x1, y1, int(0.2 * MM))]
+        p.seed_discs = [(0, 0, 0, int(0.3 * MM))]
+        p.bbox = (-MM, -MM, x1 + MM, y1 + MM)
+        f = df.solve(p, pitch)
+        ix = int(round((x1 - f.origin[0]) / pitch))
+        iy = int(round((y1 - f.origin[1]) / pitch))
+        exact = 30 * MM - 0.3 * MM
+        assert abs(f.dist[0, iy, ix] / exact - 1) < 0.03, (deg, f.dist[0, iy, ix] / exact)
+
+    p = df.NetPrimitives()
+    p.num_layers = 1
+    p.polys = [(0, [square(0, 0, 20 * MM)])]
+    p.seed_discs = [(0, 10 * MM, 10 * MM, int(0.3 * MM))]
+    p.bbox = (0, 0, 20 * MM, 20 * MM)
+    f = df.solve(p, pitch)
+    xs = f.origin[0] + np.arange(f.nx) * pitch
+    ys = f.origin[1] + np.arange(f.ny) * pitch
+    X, Y = np.meshgrid(xs, ys)
+    exact = np.hypot(X - 10 * MM, Y - 10 * MM) - 0.3 * MM
+    far = np.isfinite(f.dist[0]) & (exact > 3 * MM) & (np.abs(X - 10 * MM) < 9.5 * MM) \
+        & (np.abs(Y - 10 * MM) < 9.5 * MM)
+    rel = f.dist[0][far] / exact[far] - 1
+    assert rel.max() < 0.03 and rel.min() > -0.01, (rel.min(), rel.max())
+
+
+def test_knight_moves_do_not_jump_gaps():
+    """Two parallel traces one cell apart, joined only at one end: the far end
+    of the second trace must be reached the long way round."""
+    pitch = int(0.1 * MM)
+    p = df.NetPrimitives()
+    p.num_layers = 1
+    w = int(0.05 * MM)   # rasterises to single-cell-wide traces
+    p.segments = [(0, 0, 0, 10 * MM, 0, w),
+                  (0, 10 * MM, 0, 10 * MM, 2 * pitch, w),
+                  (0, 10 * MM, 2 * pitch, 0, 2 * pitch, w)]
+    p.sources = [(0, 0, 0)]
+    p.bbox = (-MM, -MM, 11 * MM, MM)
+    f = df.solve(p, pitch)
+    ix = int(round((0 - f.origin[0]) / pitch))
+    iy = int(round((2 * pitch - f.origin[1]) / pitch))
+    assert f.dist[0, iy, ix] / MM > 19.0, f.dist[0, iy, ix] / MM
+
+
 def test_cancel():
     p = df.NetPrimitives()
     p.num_layers = 1

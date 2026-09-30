@@ -75,6 +75,27 @@ def _listen_for_instances(on_raise):
     return server
 
 
+def _enable_hidpi():
+    """Draw at the display's real resolution.
+
+    KiCad's pythonw.exe declares no DPI awareness in its manifest, so Windows
+    renders the window at 96 DPI and stretches the bitmap on scaled displays,
+    which blurs everything. This must run before the first window exists.
+    """
+    if sys.platform != "win32":
+        return
+    import ctypes
+    try:  # Windows 10 1703+: per-monitor v2, rescales when moved between displays
+        if ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
+            return
+    except (AttributeError, OSError):
+        pass
+    try:  # Windows 8.1+: per-monitor
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except (AttributeError, OSError):
+        ctypes.windll.user32.SetProcessDPIAware()
+
+
 def _install_excepthooks():
     def hook(exc_type, exc, tb):
         log.critical("uncaught exception", exc_info=(exc_type, exc, tb))
@@ -91,6 +112,7 @@ def main():
         log.info("another window is already open; asked it to come forward")
         return
 
+    _enable_hidpi()
     import wx
     from live import LiveSession
     from viewer import IsoplotFrame

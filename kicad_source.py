@@ -15,6 +15,7 @@ Vias and pads only count on the layers where KiCad actually flashes copper
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
 
 from kipy.board_types import (ArcTrack, BoardArc, BoardBezier, BoardCircle, BoardPolygon,
@@ -22,10 +23,12 @@ from kipy.board_types import (ArcTrack, BoardArc, BoardBezier, BoardCircle, Boar
 from kipy.errors import ApiError
 from kipy.proto.board.board_types_pb2 import BoardLayer, PadStackType, ZoneType
 from kipy.proto.common import ApiStatusCode
-from kipy.proto.common.types import KiCadObjectType
+from kipy.proto.common.types import KIID, KiCadObjectType
 from kipy.util.board_layer import canonical_name, iter_copper_layers
 
 import distance_field as df
+
+log = logging.getLogger(__name__)
 
 _COPPER_ORDER = list(iter_copper_layers())          # F.Cu, In1.Cu .. In30.Cu, B.Cu
 _STACK_POS = {lid: i for i, lid in enumerate(_COPPER_ORDER)}
@@ -49,6 +52,39 @@ _COPPER_RGB.update({"In%d.Cu" % i: _INNER_RGB[(i - 1) % len(_INNER_RGB)]
                     for i in range(1, 31)})
 
 
+class KiCadFeatures:
+    """What the connected KiCad's API offers, decided once from its version.
+
+    Every version-dependent behaviour gets a flag here, so the rest of the code
+    asks ``features.x`` instead of comparing versions. The readers still turn a
+    flag off if KiCad refuses the call anyway (a nightly build numbered oddly,
+    or an older kicad-python), so a wrong guess costs one refused request.
+    """
+
+    def __init__(self, version=None, description=""):
+        """``version``: (major, minor, patch) of KiCad; None if unknown, in
+        which case everything is tried and refusals switch features off."""
+        self.version = tuple(version) if version else None
+        self.description = description or ".".join(map(str, self.version or ())) or "unknown"
+
+        def since(*v):
+            return self.version is None or self.version >= v
+
+        self.padstack_presence = since(9, 0, 3)   # CheckPadstackPresenceOnLayers
+        self.layer_names = since(9, 0, 8)         # GetBoardLayerName (user layer names)
+        self.net_queries = since(10, 0, 1)        # GetItemsById (10.0.0) + GetItemsByNet
+
+    @classmethod
+    def of(cls, kicad):
+        """Features of the KiCad behind a ``kipy.KiCad`` connection."""
+        v = kicad.get_version()
+        return cls((v.major, v.minor, v.patch), v.full_version)
+
+    def __str__(self):
+        on = [k for k, v in vars(self).items() if v is True]
+        return "KiCad %s (%s)" % (self.description, ", ".join(on) or "base features only")
+
+
 class SeedError(Exception):
     """The seed pads/vias no longer exist or are not on a net."""
 
@@ -57,6 +93,11 @@ def is_busy(exc):
     """True if ``exc`` means "KiCad is busy (e.g. mid-drag), try again later"."""
     return isinstance(exc, ApiError) and exc.code in (ApiStatusCode.AS_BUSY,
                                                       ApiStatusCode.AS_NOT_READY)
+
+
+def _unsupported(exc):
+    """True if ``exc`` means "this KiCad does not know that request"."""
+    return exc.code in (ApiStatusCode.AS_UNHANDLED, ApiStatusCode.AS_UNIMPLEMENTED)
 
 
 class NetGeometry:
@@ -76,9 +117,13 @@ class NetGeometry:
 class BoardReader:
     """Reads seeds and net copper from one open board."""
 
-    def __init__(self, board):
+    def __init__(self, board, features=None):
         self.board = board
-        self._have_layer_names = True
+        self.features = features or KiCadFeatures()
+        # Start from what the version promises; a refused call turns it off.
+        self._have_layer_names = self.features.layer_names
+        self._have_net_queries = self.features.net_queries   # fetch just the seed net
+        self._have_presence = self.features.padstack_presence
 
     @property
     def name(self):
@@ -107,22 +152,49 @@ class BoardReader:
         net's copper is unchanged since ``previous_fingerprint``."""
         copper = sorted((lid for lid in self.board.get_enabled_layers()
                          if lid in _STACK_POS), key=_STACK_POS.get)
-        items = self.board.get_items(_NET_ITEM_TYPES)
+        found = self._seed_net_items(seed_ids) if self._have_net_queries else None
+        if found is None:
+            found = self._seed_net_items_from_board(seed_ids)
+        net, net_items = found
 
-        by_id = {i.id.value: i for i in items if isinstance(i, (Pad, Via))}
+        by_id = {i.id.value: i for i in net_items if isinstance(i, (Pad, Via))}
         seeds = [by_id[s] for s in seed_ids if s in by_id]
-        if not seeds:
-            raise SeedError("The selected pad/via no longer exists.")
-        net = seeds[0].net.name
-        if not net:
-            raise SeedError("The selected pad/via is not connected to a net.")
-        seeds = [s for s in seeds if s.net.name == net]
-        net_items = [i for i in items if _net_name(i) == net]
-
         fingerprint = _fingerprint(net_items, seeds, copper)
         if fingerprint == previous_fingerprint:
             return None
         return self._convert(net, net_items, seeds, copper, fingerprint)
+
+    def _seed_net_items(self, seed_ids):
+        """(net, items on it) through the per-item and per-net queries of
+        KiCad 10.0.1+, which send only that net's items instead of the whole
+        board. None when this KiCad or kipy lacks them (then remembered, and
+        the whole-board read is used from then on)."""
+        try:
+            found = self.board.get_items_by_id([KIID(value=s) for s in seed_ids])
+            first = _first_seed(found, seed_ids)
+            items = self.board.get_items_by_net(first.net, _NET_ITEM_TYPES)
+        except AttributeError:          # kicad-python older than 0.7
+            pass
+        except ApiError as e:
+            if is_busy(e):
+                raise                   # the caller waits for KiCad
+            if not _unsupported(e):
+                # e.g. an id KiCad no longer knows: let the whole-board read
+                # report it the usual way this time.
+                return None
+        else:
+            net = first.net.name
+            return net, [i for i in items if _net_name(i) == net]
+        log.info("%s refused the per-net item query; reading the whole board instead",
+                 self.features.description)
+        self._have_net_queries = False
+        return None
+
+    def _seed_net_items_from_board(self, seed_ids):
+        """(net, items on it), picked out of all the board's items (any KiCad)."""
+        items = self.board.get_items(_NET_ITEM_TYPES)
+        net = _first_seed(items, seed_ids).net.name
+        return net, [i for i in items if _net_name(i) == net]
 
     # -- conversion ---------------------------------------------------------
     def _convert(self, net, items, seeds, copper, fingerprint):
@@ -215,19 +287,22 @@ class BoardReader:
         """Map item id -> copper layers (stack order) where it has copper."""
         if not items:
             return {}
-        try:
-            found = self.board.check_padstack_presence_on_layers(items, copper)
-            return {item.id.value: [lid for lid in copper if layers.get(lid)]
-                    for item, layers in found.items()}
-        except ApiError as e:
-            if is_busy(e):
-                raise
-            # Older KiCad: fall back to the padstack's nominal layer set.
-            return {i.id.value: [lid for lid in copper if lid in set(i.padstack.layers)]
-                    for i in items}
+        if self._have_presence:
+            try:
+                found = self.board.check_padstack_presence_on_layers(items, copper)
+                return {item.id.value: [lid for lid in copper if layers.get(lid)]
+                        for item, layers in found.items()}
+            except ApiError as e:
+                if is_busy(e):
+                    raise
+                if _unsupported(e):
+                    self._have_presence = False
+        # Older KiCad: the padstack's nominal layer set.
+        return {i.id.value: [lid for lid in copper if lid in set(i.padstack.layers)]
+                for i in items}
 
     def _layer_name(self, lid):
-        if self._have_layer_names:  # needs KiCad 9.0.8+ for user layer names
+        if self._have_layer_names:  # user layer names
             try:
                 return self.board.get_layer_name(lid)
             except ApiError as e:
@@ -240,6 +315,17 @@ class BoardReader:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _first_seed(items, seed_ids):
+    """The first of ``seed_ids`` found among ``items``; it decides the net."""
+    by_id = {i.id.value: i for i in items if isinstance(i, (Pad, Via))}
+    seed = next((by_id[s] for s in seed_ids if s in by_id), None)
+    if seed is None:
+        raise SeedError("The selected pad/via no longer exists.")
+    if not seed.net.name:
+        raise SeedError("The selected pad/via is not connected to a net.")
+    return seed
+
 
 def _net_name(item):
     if isinstance(item, Zone):

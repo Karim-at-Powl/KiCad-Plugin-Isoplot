@@ -7,8 +7,10 @@ Two daemon threads:
   net and hands changed geometry to the solver. The IPC API has no change
   notifications, so polling is the only option; a fingerprint of the net's
   items keeps unchanged boards from being re-solved.
-* the *solver* computes distance fields: a quick coarse pass first so the view
-  reacts immediately, then a fine pass. A newer job cancels the one in progress.
+* the *solver* computes distance fields: for big nets a quick coarse pass first
+  so the view reacts immediately, then a fine pass (small nets get the fine
+  pass straight away). It also prepares the result for display, keeping that
+  work off the UI thread. A newer job cancels the one in progress.
 
 Everything the UI sees goes through ``wx.CallAfter``.
 """
@@ -26,10 +28,11 @@ from kipy.proto.common.types import DocumentType
 
 import distance_field as df
 import kicad_source as ks
+import viewer
 
 log = logging.getLogger(__name__)
 
-SELECTION_POLL_S = 0.25
+SELECTION_POLL_S = 0.1          # a selection query takes well under 1 ms
 MIN_GEOMETRY_POLL_S = 1.0
 BUSY_NOTICE_S = 0.5            # report "KiCad is busy" after this long
 GIVE_UP_AFTER_S = 30.0          # close once KiCad has been unreachable this long
@@ -39,6 +42,9 @@ COARSE_CELLS = 250_000          # grid cells summed over layers
 COARSE_MIN_PITCH_NM = 100_000
 FINE_CELLS = 2_500_000
 FINE_MIN_PITCH_NM = 50_000
+# Below this many (estimated) copper cells on the fine grid, the fine pass is
+# quick enough on its own; a coarse pass first would only add a redraw.
+COARSE_ABOVE_CELLS = 400_000
 
 MM = 1e6
 
@@ -92,6 +98,7 @@ class LiveSession:
     # -- poller thread --------------------------------------------------------
     def _run(self):
         kicad = None
+        features = None             # ks.KiCadFeatures of the connected KiCad
         reader = None
         seed_ids = ()
         last_fp = None
@@ -101,6 +108,7 @@ class LiveSession:
         busy_since = None
         busy_shown = False
         last_status = None
+        changed_at = None           # when a new selection was noticed
 
         def status(text):
             nonlocal last_status
@@ -113,8 +121,13 @@ class LiveSession:
             try:
                 if kicad is None:
                     kicad = KiCad(client_name="net-isoplot", timeout_ms=API_TIMEOUT_MS)
+                    features = None
+                if features is None:
+                    # Once per connection: what this KiCad's API offers.
+                    features = ks.KiCadFeatures.of(kicad)
+                    log.info("connected to %s", features)
                 if reader is None:
-                    reader = ks.BoardReader(kicad.get_board())
+                    reader = ks.BoardReader(kicad.get_board(), features)
                     seed_ids, last_fp, outline_fp = (), None, None
                     log.info("attached to board %s", reader.name)
                     status("Connected to %s" % reader.name)
@@ -134,6 +147,7 @@ class LiveSession:
                 selected = reader.selected_seed_ids()
                 if selected and selected != seed_ids and (self._follow or adopt or not seed_ids):
                     seed_ids, last_fp = selected, None
+                    changed_at = time.perf_counter()
 
                 if not seed_ids:
                     status("Select a pad or via in the PCB editor")
@@ -150,6 +164,8 @@ class LiveSession:
                                  elapsed * 1e3)
                         last_fp = geometry.fingerprint
                         last_status = None
+                        geometry.changed_at = changed_at or t0
+                        changed_at = None
                         self._solver.submit(geometry)
                 busy_since = None
                 if busy_shown:
@@ -248,15 +264,19 @@ class _Solver:
                                    FINE_MIN_PITCH_NM)
         coarse = df.pitch_for_budget(prims.bbox, prims.num_layers, COARSE_CELLS,
                                      COARSE_MIN_PITCH_NM)
-        passes = [coarse, fine] if coarse > 1.25 * fine else [fine]
+        big = df.copper_area(prims) / float(fine) ** 2 > COARSE_ABOVE_CELLS
+        passes = [coarse, fine] if big and coarse > 1.25 * fine else [fine]
         for i, pitch in enumerate(passes):
             final = i == len(passes) - 1
-            self._post("set_status", "Computing %s (grid %.2f mm)..."
+            self._post("set_status", "computing %s (grid %.2f mm)..."
                        % (geometry.net_name, pitch / MM))
             t0 = time.perf_counter()
             field = df.solve(prims, pitch, cancel=cancel)
+            display = viewer.prepare_layers(field)   # here, not on the UI thread
             elapsed = time.perf_counter() - t0
             if cancel():
                 return
-            log.info("solved %s @ %.3f mm in %.2f s", geometry.net_name, pitch / MM, elapsed)
-            self._post("show_result", geometry, field, final, elapsed)
+            log.info("solved %s @ %.3f mm in %.2f s (%.0f ms after the change was seen)",
+                     geometry.net_name, pitch / MM, elapsed,
+                     (time.perf_counter() - geometry.changed_at) * 1e3)
+            self._post("show_result", geometry, field, display, final, elapsed)
