@@ -287,6 +287,54 @@ def test_per_net_query_busy_and_seed_errors():
             raise AssertionError("seed error not reported for %r" % (seeds,))
 
 
+class BusyBoard(FakeBoard):
+    """KiCad with one pad selected: its point editor is active, so item reads
+    are refused, but the selection, pad shapes and padstacks still answer."""
+
+    busy = False
+
+    def get_items(self, types):
+        if self.busy:
+            raise ApiError("busy", code=ApiStatusCode.AS_BUSY)
+        return super().get_items(types)
+
+
+def test_busy_kicad_answers_from_the_snapshot():
+    board = BusyBoard(board_fixture().items)
+    clock = [0.0]
+    reader = ks.BoardReader(board, ks.KiCadFeatures((9, 0, 5)), clock=lambda: clock[0])
+    reader.keep_snapshot_fresh()                     # nothing selected yet
+    board.busy = True
+    board.selection = ("pad1",)
+    assert reader.selected_seed_ids() == ("pad1",) and reader.single_pad_selected()
+    g = reader.fetch(("pad1",))
+    assert reader.stale and g.net_name == "SIG"
+    board.busy = False
+    _same_geometry(g, ks.BoardReader(board_fixture()).fetch(("pad1",)))
+    # Once KiCad answers again an unchanged board is not solved twice.
+    assert reader.fetch(("pad1",), g.fingerprint) is None and not reader.stale
+    # No snapshot to fall back on: the busy error comes through.
+    board.busy = True
+    fresh = ks.BoardReader(board, ks.KiCadFeatures((9, 0, 5)))
+    fresh.keep_snapshot_fresh()                      # skipped quietly
+    try:
+        fresh.fetch(("pad1",))
+    except ApiError as e:
+        assert ks.is_busy(e)
+    else:
+        raise AssertionError("busy KiCad without a snapshot not reported")
+
+
+def test_snapshot_is_refreshed_when_due():
+    board = FakeBoardV10(board_fixture().items)
+    clock = [0.0]
+    reader = ks.BoardReader(board, ks.KiCadFeatures((10, 0, 1)), clock=lambda: clock[0])
+    for t in (0.0, 1.0, 2.0, ks._SNAPSHOT_S + 0.1):
+        clock[0] = t
+        reader.keep_snapshot_fresh()
+    assert board.calls.count("get_items") == 2, board.calls
+
+
 def test_via_diameter_front_inner_back():
     v = via("v", "N", 0, 0)
     ps = v.proto.pad_stack

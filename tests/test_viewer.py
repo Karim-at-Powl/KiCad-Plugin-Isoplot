@@ -100,6 +100,29 @@ def test_nearer_layer_shows_where_layers_overlap():
     assert far is not None and far > 10 * MM, far
 
 
+def test_board_view_draws_outline_and_messages():
+    """Painting with a message up must not fail (it used to leave the view
+    black at startup), and the startup note goes once the outline is in."""
+    frame = wx.Frame(None)
+    try:
+        view = viewer._BoardView(frame, wx.Size(300, 200))
+        view.SetSize(300, 200)
+        bmp = wx.Bitmap(300, 200, 24)
+        dc = wx.MemoryDC(bmp)
+        view.draw(dc)                                # "Starting..." only
+        view.set_outline([square(0, 0, 50 * MM)], [])
+        assert view._message is None
+        view.draw(dc)                                # the bare board
+        view.set_message("No layers selected\nsecond line")
+        view.draw(dc)
+        dc.SelectObject(wx.NullBitmap)
+        pixel = bmp.ConvertToImage()
+        board = viewer._BOARD_COLOUR
+        assert (pixel.GetRed(150, 20), pixel.GetGreen(150, 20)) == board[:2], "no board drawn"
+    finally:
+        frame.Destroy()
+
+
 if __name__ == "__main__":
     app = wx.App(False)
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

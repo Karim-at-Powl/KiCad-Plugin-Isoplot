@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import math
+import time
 
 from kipy.board_types import (ArcTrack, BoardArc, BoardBezier, BoardCircle, BoardPolygon,
                               BoardRectangle, BoardSegment, Pad, Track, Via, Zone)
@@ -41,6 +42,8 @@ _SEED_TYPES = [KiCadObjectType.KOT_PCB_PAD, KiCadObjectType.KOT_PCB_VIA]
 _COPPER_ZONES = (ZoneType.ZT_COPPER, ZoneType.ZT_TEARDROP)
 
 _ARC_SEG_NM = 100_000   # max chord length when sampling arcs
+_SNAPSHOT_S = 3.0       # re-read the board snapshot at most this often ...
+_SNAPSHOT_DUTY = 20     # ... and no more than 1/20 of the time
 
 # KiCad "KiCad Default" theme copper-layer colours, for the layer swatches (the
 # API does not expose the colour theme).
@@ -115,15 +118,30 @@ class NetGeometry:
 
 
 class BoardReader:
-    """Reads seeds and net copper from one open board."""
+    """Reads seeds and net copper from one open board.
 
-    def __init__(self, board, features=None):
+    KiCad refuses item reads (GetItems and the per-net queries) with AS_BUSY
+    whenever a tool other than the selection tool is active. In the PCB editor
+    that includes simply having one pad selected: the point editor starts on
+    it (without any points to edit) and stays active until the selection
+    changes. The selection itself, pad polygons and padstack layers can still
+    be read, so the reader keeps a snapshot of the board's net items and
+    answers from it while KiCad is busy. ``stale`` tells whether the last
+    fetch had to.
+    """
+
+    def __init__(self, board, features=None, clock=time.monotonic):
         self.board = board
         self.features = features or KiCadFeatures()
         # Start from what the version promises; a refused call turns it off.
         self._have_layer_names = self.features.layer_names
         self._have_net_queries = self.features.net_queries   # fetch just the seed net
         self._have_presence = self.features.padstack_presence
+        self._clock = clock
+        self._selected = {}             # id -> Pad/Via, as last read from the selection
+        self._snapshot = None           # id -> item: all net items, as last read
+        self._snapshot_due = 0.0        # when keep_snapshot_fresh() reads it again
+        self.stale = False              # the last fetch came from the snapshot
 
     @property
     def name(self):
@@ -132,7 +150,31 @@ class BoardReader:
     def selected_seed_ids(self):
         """IDs of the pads/vias currently selected in the PCB editor."""
         items = self.board.get_selection(_SEED_TYPES)
-        return tuple(sorted(i.id.value for i in items if isinstance(i, (Pad, Via))))
+        self._selected = {i.id.value: i for i in items if isinstance(i, (Pad, Via))}
+        return tuple(sorted(self._selected))
+
+    def single_pad_selected(self):
+        """True if the last selection read was one pad (see the class notes)."""
+        return len(self._selected) == 1 and isinstance(next(iter(self._selected.values())), Pad)
+
+    def keep_snapshot_fresh(self):
+        """Re-read the board snapshot if it is due. A busy KiCad is skipped
+        silently (the snapshot is what covers for it)."""
+        if self._clock() < self._snapshot_due:
+            return
+        try:
+            self._read_board_items()
+        except ApiError as e:
+            if not is_busy(e):
+                raise
+
+    def _read_board_items(self):
+        t0 = self._clock()
+        items = self.board.get_items(_NET_ITEM_TYPES)
+        now = self._clock()
+        self._snapshot = {i.id.value: i for i in items}
+        self._snapshot_due = now + max(_SNAPSHOT_S, _SNAPSHOT_DUTY * (now - t0))
+        return items
 
     def board_outline(self):
         """The board's Edge.Cuts as (fingerprint, closed rings, open chains).
@@ -149,12 +191,23 @@ class BoardReader:
 
     def fetch(self, seed_ids, previous_fingerprint=None):
         """Return the NetGeometry for the net of ``seed_ids``, or None if the
-        net's copper is unchanged since ``previous_fingerprint``."""
+        net's copper is unchanged since ``previous_fingerprint``.
+
+        While KiCad is busy the net comes from the board snapshot, if there
+        is one (``stale`` is then True); otherwise the busy error is raised.
+        """
         copper = sorted((lid for lid in self.board.get_enabled_layers()
                          if lid in _STACK_POS), key=_STACK_POS.get)
-        found = self._seed_net_items(seed_ids) if self._have_net_queries else None
-        if found is None:
-            found = self._seed_net_items_from_board(seed_ids)
+        try:
+            found = self._seed_net_items(seed_ids) if self._have_net_queries else None
+            if found is None:
+                found = self._seed_net_items_from_board(seed_ids)
+            self.stale = False
+        except ApiError as e:
+            if not is_busy(e) or self._snapshot is None:
+                raise
+            found = self._seed_net_items_from_snapshot(seed_ids)
+            self.stale = True
         net, net_items = found
 
         by_id = {i.id.value: i for i in net_items if isinstance(i, (Pad, Via))}
@@ -191,8 +244,18 @@ class BoardReader:
         return None
 
     def _seed_net_items_from_board(self, seed_ids):
-        """(net, items on it), picked out of all the board's items (any KiCad)."""
-        items = self.board.get_items(_NET_ITEM_TYPES)
+        """(net, items on it), picked out of all the board's items (any KiCad).
+        The read doubles as a fresh snapshot."""
+        items = self._read_board_items()
+        net = _first_seed(items, seed_ids).net.name
+        return net, [i for i in items if _net_name(i) == net]
+
+    def _seed_net_items_from_snapshot(self, seed_ids):
+        """(net, items on it) from the snapshot, with the selected pads/vias
+        as just read (the selection can be read while KiCad is busy)."""
+        by_id = dict(self._snapshot)
+        by_id.update(self._selected)
+        items = list(by_id.values())
         net = _first_seed(items, seed_ids).net.name
         return net, [i for i in items if _net_name(i) == net]
 

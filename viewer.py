@@ -25,6 +25,7 @@ _OPACITY = 0.6
 _VIEW_W = 760                      # initial board view size (DIP)
 _VIEW_H = 620
 _SETTLE_MS = 120                   # re-render this long after the last zoom/pan
+_STARTING = "Starting..."          # shown until the board outline arrives
 MM = 1e6
 
 
@@ -403,7 +404,7 @@ class _BoardView(wx.Panel):
         self._seeds = ()                # ("disc", x, y, r) / ("poly", points) in nm
         self._rings = []                # closed board outline rings (nm)
         self._chains = []               # open outline pieces (nm)
-        self._message = "Starting..."
+        self._message = _STARTING
         self._zoom = 1.0
         self._center = None             # world point at the view centre; None = fitted
         self._drag = None
@@ -430,6 +431,8 @@ class _BoardView(wx.Panel):
     def set_outline(self, rings, chains):
         old = self._bounds()
         self._rings, self._chains = rings, chains
+        if self._message == _STARTING and (rings or chains):
+            self._message = None    # the board is up; the footer says what to do
         if self._bounds() != old:
             self.fit()
         self._invalidate()
@@ -543,7 +546,7 @@ class _BoardView(wx.Panel):
         if self._message:
             dc.SetFont(self.GetFont())
             dc.SetTextForeground(wx.Colour(60, 60, 60))
-            tw, th, _ = dc.GetMultiLineTextExtent(self._message)
+            tw, th = dc.GetMultiLineTextExtent(self._message)   # a wx.Size
             w, h = self.GetClientSize()
             dc.DrawText(self._message, (w - tw) // 2, (h - th) // 2)
 
@@ -862,14 +865,18 @@ class IsoplotFrame(wx.Frame):
         self._status = text
         self._update_footer()
 
-    def set_busy(self, busy):
-        """KiCad refuses API calls while an interactive tool is running."""
-        self._busy = busy
+    def set_busy(self, busy, pad_selected=False):
+        """KiCad refuses item reads while a tool is active - which includes
+        having a single pad selected (see kicad_source.BoardReader)."""
+        self._busy = "pad" if busy and pad_selected else busy
         self._update_footer()
 
     def _update_footer(self):
         """One line: the grid shown, then what is going on."""
-        if self._busy:
+        if self._busy == "pad":
+            status = ("KiCad holds back board edits while one pad is selected - "
+                      "they show after your next click in KiCad")
+        elif self._busy:
             status = ("KiCad is busy (a tool is active) - updates resume when you "
                       "leave the tool (Esc)")
         else:

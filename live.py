@@ -116,6 +116,21 @@ class LiveSession:
                 last_status = text
                 self._post("set_status", text)
 
+        def busy(is_busy):
+            """Report "KiCad is busy" once it has lasted a moment."""
+            nonlocal busy_since, busy_shown
+            if not is_busy:
+                busy_since = None
+                if busy_shown:
+                    busy_shown = False
+                    self._post("set_busy", False)
+                return
+            busy_since = busy_since or now
+            if not busy_shown and now - busy_since >= BUSY_NOTICE_S:
+                busy_shown = True
+                self._post("set_busy", True,
+                           reader is not None and reader.single_pad_selected())
+
         while not self._stop.is_set():
             now = time.monotonic()
             try:
@@ -134,13 +149,16 @@ class LiveSession:
                 unreachable_since = None
 
                 # The outline is read when attaching to a board and on request
-                # ("Update Board Outline"), not polled.
+                # ("Update Board Outline"), not polled. KiCad refuses it while
+                # busy (e.g. one pad selected); it is simply tried again.
                 if outline_fp is None or self._outline_request:
-                    fp, rings, chains = reader.board_outline()
-                    self._outline_request = False
-                    if fp != outline_fp:
-                        outline_fp = fp
-                        self._post("set_outline", rings, chains)
+                    outline = self._try_while_busy(reader.board_outline)
+                    if outline is not None:
+                        fp, rings, chains = outline
+                        self._outline_request = False
+                        if fp != outline_fp:
+                            outline_fp = fp
+                            self._post("set_outline", rings, chains)
 
                 force, self._force = self._force, False
                 adopt, self._adopt = self._adopt, False
@@ -148,9 +166,12 @@ class LiveSession:
                 if selected and selected != seed_ids and (self._follow or adopt or not seed_ids):
                     seed_ids, last_fp = selected, None
                     changed_at = time.perf_counter()
+                # Kept current so a seed can be resolved while KiCad is busy.
+                reader.keep_snapshot_fresh()
 
                 if not seed_ids:
                     status("Select a pad or via in the PCB editor")
+                    busy(False)
                 elif last_fp is None or force or now >= next_geometry:
                     if not self._same_board(kicad, reader):
                         reader = None
@@ -160,17 +181,16 @@ class LiveSession:
                     elapsed = time.perf_counter() - t0
                     next_geometry = time.monotonic() + max(MIN_GEOMETRY_POLL_S, 5 * elapsed)
                     if geometry is not None:
-                        log.info("net %s changed (read in %.0f ms)", geometry.net_name,
-                                 elapsed * 1e3)
+                        log.info("net %s changed (read in %.0f ms%s)", geometry.net_name,
+                                 elapsed * 1e3, ", from the snapshot" if reader.stale else "")
                         last_fp = geometry.fingerprint
                         last_status = None
                         geometry.changed_at = changed_at or t0
                         changed_at = None
                         self._solver.submit(geometry)
-                busy_since = None
-                if busy_shown:
-                    busy_shown = False
-                    self._post("set_busy", False)
+                    # From the snapshot: fine for a new selection, but edits
+                    # only show once KiCad answers again.
+                    busy(reader.stale)
             except ks.SeedError as e:
                 seed_ids, last_fp = (), None
                 status("%s Select a pad or via." % e)
@@ -186,11 +206,8 @@ class LiveSession:
             except ApiError as e:
                 if ks.is_busy(e):
                     # An interactive tool (routing, via placement, drag...) is
-                    # active; KiCad refuses all API calls until it ends.
-                    busy_since = busy_since or now
-                    if not busy_shown and now - busy_since >= BUSY_NOTICE_S:
-                        busy_shown = True
-                        self._post("set_busy", True)
+                    # active; KiCad refuses item reads until it ends.
+                    busy(True)
                 else:
                     # No board open, the board was closed/replaced, or a stale
                     # document: start over with a fresh board handle.
@@ -203,6 +220,16 @@ class LiveSession:
                 status("Unexpected error (see log); retrying")
             self._wake.wait(SELECTION_POLL_S)
             self._wake.clear()
+
+    @staticmethod
+    def _try_while_busy(read):
+        """``read()``, or None if KiCad is busy."""
+        try:
+            return read()
+        except ApiError as e:
+            if ks.is_busy(e):
+                return None
+            raise
 
     @staticmethod
     def _same_board(kicad, reader):
