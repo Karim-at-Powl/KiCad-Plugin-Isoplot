@@ -1,0 +1,4 @@
+# Installed by KiCad into this plugin's virtual environment on first use.
+# The environment also sees KiCad's bundled Python packages (wxPython, NumPy).
+kicad-python>=0.5.0
+numpy

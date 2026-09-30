@@ -1,0 +1,21 @@
+{
+    "$schema": "https://go.kicad.org/api/schemas/v1",
+    "identifier": "tech.powl.net_isoplot",
+    "name": "Net Isoplot",
+    "description": "Live heatmap of along-copper distance from the selected pad/via to the rest of its net",
+    "runtime": {
+        "type": "python"
+    },
+    "actions": [
+        {
+            "identifier": "open-viewer",
+            "name": "Net Isoplot",
+            "description": "Open the live along-copper distance heatmap for the selected pad or via",
+            "show-button": true,
+            "scopes": ["pcb"],
+            "entrypoint": "isoplot.py",
+            "icons-light": ["icons/icon-24.png", "icons/icon-48.png"],
+            "icons-dark": ["icons/icon-24.png", "icons/icon-48.png"]
+        }
+    ]
+}

@@ -1,8 +1,8 @@
 {
     "$schema": "https://go.kicad.org/pcm/schemas/v1",
     "name": "Net Isoplot",
-    "description": "Heatmap of along-copper distance from a selected pad/via to its net",
-    "description_full": "Select any pad or via and run the plugin: it computes the geodesic (along-copper) distance from the selection to every reachable point on the same net, across all copper layers (connected through vias), and draws a colour heatmap overlay with a legend. Blue marks points near the selection, red marks the furthest points - a quick visual aid for spotting and shortening current loops. Works with zero external dependencies (pure Python + bundled wxPython); uses NumPy automatically for a finer/faster result when it is installed.",
+    "description": "Live heatmap of along-copper distance from a selected pad/via across its net",
+    "description_full": "Select any pad or via and open Net Isoplot: a window beside KiCad colours every point of that net by its geodesic (along-copper) distance from the selection, across all copper layers joined by vias and plated holes. Red marks points near the selection, blue the furthest ones - a quick visual aid for spotting and shortening current loops. The window stays open and updates live as you select other pads or edit the board. Requires KiCad 9.0.5+ with the KiCad API enabled (Preferences > Plugins).",
     "identifier": "tech.powl.net_isoplot",
     "type": "plugin",
     "author": {
@@ -22,7 +22,7 @@
     ],
     "versions": [
         {
-            "version": "0.1.0",
+            "version": "0.2.0",
             "status": "development",
             "kicad_version": "9.0"
         }

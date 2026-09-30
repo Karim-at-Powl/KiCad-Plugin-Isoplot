@@ -1,0 +1,218 @@
+"""Offline tests for kicad_source: real kipy item types, fake board API.
+
+Needs the kicad-python package (``kipy``) importable, but no running KiCad.
+Run:  python tests/test_kicad_source.py
+"""
+import math
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from kipy.board_types import Pad, Track, Via, Zone
+from kipy.errors import ApiError
+from kipy.geometry import PolygonWithHoles
+from kipy.proto.board import board_types_pb2 as bt
+from kipy.proto.common import ApiStatusCode
+from kipy.proto.common.types import base_types_pb2 as base
+
+import distance_field as df
+import kicad_source as ks
+
+MM = 1_000_000
+F, IN1, B = ks._F_CU, ks._IN1_CU, ks._B_CU
+
+
+def _rect_poly(cx, cy, w, h):
+    p = base.PolygonWithHoles()
+    for (x, y) in ((cx - w / 2, cy - h / 2), (cx + w / 2, cy - h / 2),
+                   (cx + w / 2, cy + h / 2), (cx - w / 2, cy + h / 2)):
+        node = p.outline.nodes.add()
+        node.point.x_nm, node.point.y_nm = int(x), int(y)
+    p.outline.closed = True
+    return p
+
+
+def track(uid, net, layer, x0, y0, x1, y1, w=250_000):
+    t = bt.Track()
+    t.id.value = uid
+    t.net.name = net
+    t.layer = layer
+    t.start.x_nm, t.start.y_nm, t.end.x_nm, t.end.y_nm = x0, y0, x1, y1
+    t.width.value_nm = w
+    return Track(proto=t)
+
+
+def via(uid, net, x, y, dia=600_000):
+    v = bt.Via()
+    v.id.value = uid
+    v.net.name = net
+    v.position.x_nm, v.position.y_nm = x, y
+    v.type = bt.ViaType.VT_THROUGH
+    v.pad_stack.type = bt.PadStackType.PST_NORMAL
+    v.pad_stack.layers.extend([F, B])
+    cl = v.pad_stack.copper_layers.add()
+    cl.layer = F
+    cl.size.x_nm = cl.size.y_nm = dia
+    return Via(proto=v)
+
+
+def smd_pad(uid, net, x, y):
+    p = bt.Pad()
+    p.id.value = uid
+    p.net.name = net
+    p.position.x_nm, p.position.y_nm = x, y
+    p.type = bt.PadType.PT_SMD
+    p.pad_stack.layers.extend([F])
+    return Pad(proto=p)
+
+
+def zone(uid, net, layer, rect, filled=True):
+    z = bt.Zone()
+    z.id.value = uid
+    z.type = bt.ZoneType.ZT_COPPER
+    z.layers.extend([layer])
+    z.copper_settings.net.name = net
+    z.filled = filled
+    if filled:
+        fp = z.filled_polygons.add()
+        fp.layer = layer
+        fp.shapes.polygons.add().CopyFrom(_rect_poly(*rect))
+    return Zone(proto=z)
+
+
+class FakeBoard:
+    name = "fake.kicad_pcb"
+
+    def __init__(self, items, selection=()):
+        self.items = items
+        self.selection = selection
+        self.calls = []
+
+    def get_enabled_layers(self):
+        return [F, B, 40, 41]  # two copper layers + some non-copper ids
+
+    def get_items(self, types):
+        return list(self.items)
+
+    def get_selection(self, types):
+        return [i for i in self.items if i.id.value in self.selection]
+
+    def check_padstack_presence_on_layers(self, items, layers):
+        out = {}
+        for i in items:
+            on = {F, B} if isinstance(i, Via) else {F}
+            out[i] = {lid: lid in on for lid in layers}
+        return out
+
+    def get_pad_shapes_as_polygons(self, pads, layer):
+        self.calls.append(("pad_shapes", layer))
+        single = isinstance(pads, Pad)
+        pads = [pads] if single else pads
+        shapes = [PolygonWithHoles(proto=_rect_poly(p.position.x, p.position.y, 2 * MM, 1 * MM))
+                  for p in pads if layer == F]
+        if single:
+            return shapes[0] if shapes else None
+        return shapes
+
+    def get_layer_name(self, lid):
+        raise ApiError("unhandled", code=ApiStatusCode.AS_UNHANDLED)
+
+
+def board_fixture():
+    """Pad on F -> 20 mm track -> via -> 10 mm track on B + a pour on B.
+    Plus a track on another net and an unfilled zone."""
+    items = [
+        smd_pad("pad1", "SIG", 0, 0),
+        track("t1", "SIG", F, 0, 0, 20 * MM, 0),
+        via("v1", "SIG", 20 * MM, 0),
+        track("t2", "SIG", B, 20 * MM, 0, 20 * MM, 10 * MM),
+        zone("z1", "SIG", B, (20 * MM, 12 * MM, 4 * MM, 4 * MM)),
+        zone("z2", "SIG", B, (0, 0, 1 * MM, 1 * MM), filled=False),
+        track("other", "GND", F, 0, 5 * MM, 30 * MM, 5 * MM),
+    ]
+    return FakeBoard(items, selection=("pad1",))
+
+
+def test_selection_and_fetch():
+    board = board_fixture()
+    reader = ks.BoardReader(board)
+    seeds = reader.selected_seed_ids()
+    assert seeds == ("pad1",), seeds
+    g = reader.fetch(seeds)
+    p = g.prims
+    assert g.net_name == "SIG"
+    assert g.layer_names == ["F.Cu", "B.Cu"], g.layer_names
+    assert p.num_layers == 2
+    assert len(p.segments) == 2, "other-net track leaked in: %r" % (p.segments,)
+    assert len(p.vias) == 1 and p.vias[0][2] == [0, 1]
+    assert len(p.discs) == 2 and all(d[3] == 300_000 for d in p.discs)
+    assert len(p.seed_polys) == 1 and p.seed_polys[0][0] == 0
+    assert g.unfilled_zones == 1
+    # zone fill + pad polygon on F
+    assert sum(1 for q in p.polys if q[0] == 1) == 1
+    assert sum(1 for q in p.polys if q[0] == 0) == 1
+    # unchanged board -> no new geometry
+    assert reader.fetch(seeds, g.fingerprint) is None
+    # moving a track changes the fingerprint
+    board.items[1].proto.end.x_nm = 21 * MM
+    assert reader.fetch(seeds, g.fingerprint) is not None
+
+    f = df.solve(p, int(0.1 * MM))
+    far = f.max_distance_nm / MM
+    # pad edge (1 mm) -> 20 mm -> via -> ~14 mm down to the far pour edge
+    assert 30.0 < far < 36.0, far
+
+
+def test_seed_errors():
+    board = board_fixture()
+    reader = ks.BoardReader(board)
+    try:
+        reader.fetch(("gone",))
+    except ks.SeedError:
+        pass
+    else:
+        raise AssertionError("missing seed not reported")
+    board.items.append(smd_pad("nc", "", 0, 0))
+    try:
+        reader.fetch(("nc",))
+    except ks.SeedError:
+        pass
+    else:
+        raise AssertionError("unconnected seed not reported")
+
+
+def test_via_diameter_front_inner_back():
+    v = via("v", "N", 0, 0)
+    ps = v.proto.pad_stack
+    ps.type = bt.PadStackType.PST_FRONT_INNER_BACK
+    for lid, d in ((IN1, 400_000), (B, 500_000)):
+        cl = ps.copper_layers.add()
+        cl.layer = lid
+        cl.size.x_nm = d
+    assert ks._via_diameter(v, F) == 600_000
+    assert ks._via_diameter(v, ks._COPPER_ORDER[5]) == 400_000
+    assert ks._via_diameter(v, B) == 500_000
+
+
+def test_sample_arc_both_directions():
+    r = 10 * MM
+    for mid in ((r / math.sqrt(2), r / math.sqrt(2)), (-r / math.sqrt(2), -r / math.sqrt(2))):
+        pts = ks._sample_arc((r, 0), mid, (0, r), 1 * MM)
+        assert all(abs(math.hypot(x, y) - r) < 1 for x, y in pts)
+        assert pts[0] == (r, 0.0) or math.dist(pts[0], (r, 0)) < 1
+        assert math.dist(pts[-1], (0, r)) < 1
+        # the sampled path passes near the requested mid point
+        assert min(math.dist(p, mid) for p in pts) < 1 * MM
+    # quarter arc (ccw) is short, three-quarter arc (cw) is long
+    short = ks._sample_arc((r, 0), (r / math.sqrt(2), r / math.sqrt(2)), (0, r), 1 * MM)
+    long_ = ks._sample_arc((r, 0), (-r / math.sqrt(2), -r / math.sqrt(2)), (0, r), 1 * MM)
+    assert len(long_) > 2 * len(short)
+
+
+if __name__ == "__main__":
+    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
+    for t in tests:
+        t()
+        print("ok  ", t.__name__)
+    print("OK: %d tests passed" % len(tests))

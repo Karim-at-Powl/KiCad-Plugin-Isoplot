@@ -1,9 +1,13 @@
-"""Standalone smoke test for distance_field (no pcbnew needed).
+"""Standalone tests for distance_field (no KiCad needed).
 
 Run from anywhere:  python tests/test_distance_field.py
 """
+import math
 import os
 import sys
+import time
+
+import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -12,11 +16,13 @@ import distance_field as df
 MM = 1_000_000  # nm per mm
 
 
-def build_L_net():
-    """Layer 0: horizontal trace (0,0)->(20mm,0), then vertical up to (20,10).
-    Via at (20,10) down to layer 1: short trace (20,10)->(25,10).
-    Source at (0,0). Expected furthest point ~ (25,10): 20+10+5 = 35mm geodesic.
-    """
+def square(x0, y0, s):
+    return [(x0, y0), (x0 + s, y0), (x0 + s, y0 + s), (x0, y0 + s)]
+
+
+def test_L_net_across_via():
+    """Layer 0: trace (0,0)->(20,0)->(20,10); via at (20,10) to layer 1, trace
+    (20,10)->(25,10). Source at (0,0): furthest point ~35 mm along copper."""
     p = df.NetPrimitives()
     p.num_layers = 2
     w = 0.25 * MM
@@ -28,59 +34,98 @@ def build_L_net():
     p.vias = [(20 * MM, 10 * MM, [0, 1])]
     p.sources = [(0, 0, 0)]
     p.bbox = (-1 * MM, -1 * MM, 26 * MM, 11 * MM)
-    return p
+    f = df.solve(p, pitch_nm=int(0.15 * MM))
+    assert f.dist.shape == (2, f.ny, f.nx)
+    assert 33.0 < f.max_distance_nm / MM < 37.0, f.max_distance_nm / MM
+    assert np.isfinite(f.dist[1]).sum() > 50, "via did not bridge to layer 1"
 
 
-def run(label, pitch_mm):
-    p = build_L_net()
-    f = df.solve(p, pitch_nm=int(pitch_mm * MM))
-    maxmm = f.max_distance_nm / MM
-    # furthest reachable cell on layer 1
-    reached1 = sum(1 for v in f.dist[1] if v is not None)
-    print("%-22s pitch=%.2fmm grid=%dx%d max=%.2fmm (expect ~35) L1cells=%d"
-          % (label, pitch_mm, f.nx, f.ny, maxmm, reached1))
-    return maxmm
-
-
-def build_poly_net():
-    """A single 10mm x 10mm filled square (polygon) on layer 0, source near one
-    corner. Mimics a pad sitting on a continuous pour: copper is described *only*
-    by a polygon, so this exercises the poly() rasterisation path that zones and
-    rectangular pads rely on. Furthest point ~ opposite corner: ~14.1mm."""
+def test_square_polygon():
+    """10 mm filled square, source near one corner: furthest ~12.7 mm."""
     p = df.NetPrimitives()
     p.num_layers = 1
-    s = 10 * MM
-    p.polys = [(0, [(0, 0), (s, 0), (s, s), (0, s)])]
+    p.polys = [(0, [square(0, 0, 10 * MM)])]
     p.sources = [(0, 1 * MM, 1 * MM)]
-    p.bbox = (-1 * MM, -1 * MM, 11 * MM, 11 * MM)
-    return p
-
-
-def run_poly(label):
-    p = build_poly_net()
+    p.bbox = (0, 0, 10 * MM, 10 * MM)
     f = df.solve(p, pitch_nm=int(0.2 * MM))
-    cells = sum(1 for v in f.dist[0] if v is not None)
-    maxmm = f.max_distance_nm / MM
-    print("%-22s copper_cells=%d max=%.2fmm (expect ~12.7)" % (label, cells, maxmm))
-    return cells, maxmm
+    cells = int(np.isfinite(f.dist[0]).sum())
+    assert 2500 <= cells <= 2800, cells  # 50x50 interior + boundary ring
+    assert 11.0 < f.max_distance_nm / MM < 15.0, f.max_distance_nm / MM
 
 
-print("HAS_NUMPY =", df.HAS_NUMPY)
-m1 = run("numpy path" if df.HAS_NUMPY else "pure path", 0.15)
+def test_polygon_hole_forces_detour():
+    """Square with a large square hole: going around the hole is longer than
+    the straight line, and hole cells are not copper."""
+    p = df.NetPrimitives()
+    p.num_layers = 1
+    p.polys = [(0, [square(0, 0, 10 * MM), square(2 * MM, 2 * MM, 6 * MM)])]
+    p.sources = [(0, 5 * MM, 1 * MM)]
+    p.bbox = (0, 0, 10 * MM, 10 * MM)
+    f = df.solve(p, pitch_nm=int(0.2 * MM))
+    ix = int(round((5 * MM - f.origin[0]) / f.pitch_nm))
+    iy_hole = int(round((5 * MM - f.origin[1]) / f.pitch_nm))
+    iy_far = int(round((9 * MM - f.origin[1]) / f.pitch_nm))
+    assert not np.isfinite(f.dist[0, iy_hole, ix]), "hole was filled"
+    # Straight line would be 8 mm; around the hole it's > 11 mm.
+    assert f.dist[0, iy_far, ix] / MM > 11.0, f.dist[0, iy_far, ix] / MM
 
-# Polygon coverage on whichever path the environment provides (regression for
-# zone/pour copper being dropped on the NumPy path).
-pc1, pm1 = run_poly("numpy" if df.HAS_NUMPY else "pure")
-assert pc1 > 1000, "polygon fill produced almost no copper: %d cells" % pc1
-assert 11.0 < pm1 < 15.0, "polygon geodesic out of range: %s" % pm1
 
-# Force pure-python path and re-run to confirm identical-ish results.
-df.HAS_NUMPY = False
-m2 = run("forced pure-python", 0.15)
-pc2, pm2 = run_poly("forced pure-python")
+def test_seed_polygon_measures_from_pad_edge():
+    """A 4 mm seed pad at the start of a trace: distance counts from the pad
+    edge, not its centre."""
+    p = df.NetPrimitives()
+    p.num_layers = 1
+    p.polys = [(0, [square(-2 * MM, -2 * MM, 4 * MM)])]
+    p.segments = [(0, 0, 0, 20 * MM, 0, int(0.3 * MM))]
+    p.seed_polys = [(0, [square(-2 * MM, -2 * MM, 4 * MM)])]
+    p.bbox = (-2 * MM, -2 * MM, 20 * MM, 2 * MM)
+    f = df.solve(p, pitch_nm=int(0.1 * MM))
+    assert 17.5 < f.max_distance_nm / MM < 18.5, f.max_distance_nm / MM
 
-assert 33.0 < m1 < 37.0, "geodesic distance out of expected range: %s" % m1
-assert 33.0 < m2 < 37.0, "pure-python geodesic out of range: %s" % m2
-assert pc2 > 1000, "pure-python polygon fill produced almost no copper: %d" % pc2
-assert 11.0 < pm2 < 15.0, "pure-python polygon geodesic out of range: %s" % pm2
-print("OK: both paths within tolerance")
+
+def test_cancel():
+    p = df.NetPrimitives()
+    p.num_layers = 1
+    p.polys = [(0, [square(0, 0, 30 * MM)])]
+    p.sources = [(0, 0, 0)]
+    p.bbox = (0, 0, 30 * MM, 30 * MM)
+    try:
+        df.solve(p, pitch_nm=int(0.1 * MM), cancel=lambda: True)
+    except df.Cancelled:
+        return
+    raise AssertionError("solve ignored cancel")
+
+
+def test_pitch_for_budget():
+    bbox = (0, 0, 100 * MM, 50 * MM)
+    pitch = df.pitch_for_budget(bbox, 4, 1_000_000, int(0.05 * MM))
+    nx, ny, _ = df._grid_dims(bbox, pitch, 2 * pitch)
+    assert nx * ny * 4 <= 1_000_000
+    assert pitch % 10_000 == 0
+    assert df.pitch_for_budget((0, 0, MM, MM), 1, 1_000_000, 50_000) == 50_000
+
+
+def benchmark():
+    """Rough solve speed on a fully poured 60 x 40 mm, 2-layer net."""
+    p = df.NetPrimitives()
+    p.num_layers = 2
+    p.polys = [(0, [square(0, 0, 60 * MM)]), (1, [square(0, 0, 60 * MM)])]
+    p.vias = [(30 * MM, 20 * MM, [0, 1])]
+    p.sources = [(0, 0, 0)]
+    p.bbox = (0, 0, 60 * MM, 40 * MM)
+    pitch = df.pitch_for_budget(p.bbox, 2, 1_000_000, 50_000)
+    t = time.perf_counter()
+    f = df.solve(p, pitch)
+    dt = time.perf_counter() - t
+    cells = int(np.isfinite(f.dist).sum())
+    print("benchmark: %d copper cells @ %.3f mm in %.2f s (%.2f us/cell)"
+          % (cells, pitch / MM, dt, 1e6 * dt / max(1, cells)))
+
+
+if __name__ == "__main__":
+    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
+    for t in tests:
+        t()
+        print("ok  ", t.__name__)
+    benchmark()
+    print("OK: %d tests passed" % len(tests))
