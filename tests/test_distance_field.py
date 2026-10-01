@@ -96,52 +96,93 @@ def test_search_strategies_agree():
     p.seed_discs = [(0, 1 * MM, 1 * MM, int(0.4 * MM))]
     p.bbox = (0, 0, 31 * MM, 21 * MM)
     pitch = int(0.1 * MM)
-    ref = df.solve(p, pitch, to_heap=10 ** 9, to_vector=10 ** 9).dist
-    for th, tv in ((0, 0), (df.TO_HEAP, df.TO_VECTOR), (4, 8)):
-        got = df.solve(p, pitch, to_heap=th, to_vector=tv).dist
-        assert np.array_equal(np.isfinite(ref), np.isfinite(got)), (th, tv)
-        fin = np.isfinite(ref)
-        assert np.allclose(ref[fin], got[fin], rtol=0, atol=1e-6), (th, tv)
-    assert np.isfinite(ref[1]).sum() > 100, "via did not bridge to layer 1"
+    for reach in (2, df.MAX_REACH):
+        ref = df.solve(p, pitch, reach=reach, to_heap=10 ** 9, to_vector=10 ** 9).dist
+        for th, tv in ((0, 0), (df.TO_HEAP, df.TO_VECTOR), (4, 8)):
+            got = df.solve(p, pitch, reach=reach, to_heap=th, to_vector=tv).dist
+            assert np.array_equal(np.isfinite(ref), np.isfinite(got)), (reach, th, tv)
+            fin = np.isfinite(ref)
+            assert np.allclose(ref[fin], got[fin], rtol=0, atol=1e-6), (reach, th, tv)
+        assert np.isfinite(ref[1]).sum() > 100, "via did not bridge to layer 1"
+
+
+def test_move_sets():
+    """8/16/32/48 moves, neighbours first; a diagonal crosses no other cell,
+    a knight's move the two beside its line."""
+    assert [len(df.move_set(r)) for r in range(1, df.MAX_REACH + 1)] == [8, 16, 32, 48]
+    for r in range(1, df.MAX_REACH + 1):
+        moves = df.move_set(r)
+        assert len({(dx, dy) for dx, dy, _ in moves}) == len(moves)
+        assert {(dx, dy) for dx, dy, _ in moves[:8]} == \
+            {(dx, dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1)} - {(0, 0)}
+    assert df._crossed(1, 1) == ()
+    assert set(df._crossed(2, 1)) == {(1, 0), (1, 1)}
+    assert set(df._crossed(-1, 2)) == {(0, 1), (-1, 1)}
+    assert len(df._crossed(4, 3)) == 6
+
+
+# Worst-case overestimate of a grid path per reach (1 / cos of half the
+# largest angle between move directions), plus slack for the grid.
+_MAX_ERROR = {2: 0.03, 4: 0.009}
 
 
 def test_accuracy_against_exact_distances():
-    """With knight's moves the grid path overestimates by at most ~2.8 %:
-    straight traces at awkward angles, and an open pour around a round pad."""
+    """The grid path overestimates by at most ~2.7 % with 16 moves and ~0.75 %
+    with 48: straight traces at awkward angles, and an open pour around a
+    round pad."""
     pitch = int(0.05 * MM)
-    for deg in (10, 22.5, 30):
-        a = math.radians(deg)
-        x1, y1 = 30 * MM * math.cos(a), 30 * MM * math.sin(a)
+    for reach, max_error in _MAX_ERROR.items():
+        for deg in (10, 22.5, 30):
+            a = math.radians(deg)
+            x1, y1 = 30 * MM * math.cos(a), 30 * MM * math.sin(a)
+            p = df.NetPrimitives()
+            p.num_layers = 1
+            p.segments = [(0, 0, 0, x1, y1, int(0.2 * MM))]
+            p.seed_discs = [(0, 0, 0, int(0.3 * MM))]
+            p.bbox = (-MM, -MM, x1 + MM, y1 + MM)
+            f = df.solve(p, pitch, reach=reach)
+            ix = int(round((x1 - f.origin[0]) / pitch))
+            iy = int(round((y1 - f.origin[1]) / pitch))
+            exact = 30 * MM - 0.3 * MM
+            assert abs(f.dist[0, iy, ix] / exact - 1) < max_error, \
+                (reach, deg, f.dist[0, iy, ix] / exact)
+
         p = df.NetPrimitives()
         p.num_layers = 1
-        p.segments = [(0, 0, 0, x1, y1, int(0.2 * MM))]
-        p.seed_discs = [(0, 0, 0, int(0.3 * MM))]
-        p.bbox = (-MM, -MM, x1 + MM, y1 + MM)
-        f = df.solve(p, pitch)
-        ix = int(round((x1 - f.origin[0]) / pitch))
-        iy = int(round((y1 - f.origin[1]) / pitch))
-        exact = 30 * MM - 0.3 * MM
-        assert abs(f.dist[0, iy, ix] / exact - 1) < 0.03, (deg, f.dist[0, iy, ix] / exact)
+        p.polys = [(0, [square(0, 0, 20 * MM)])]
+        p.seed_discs = [(0, 10 * MM, 10 * MM, int(0.3 * MM))]
+        p.bbox = (0, 0, 20 * MM, 20 * MM)
+        f = df.solve(p, pitch, reach=reach)
+        xs = f.origin[0] + np.arange(f.nx) * pitch
+        ys = f.origin[1] + np.arange(f.ny) * pitch
+        X, Y = np.meshgrid(xs, ys)
+        exact = np.hypot(X - 10 * MM, Y - 10 * MM) - 0.3 * MM
+        far = np.isfinite(f.dist[0]) & (exact > 3 * MM) & (np.abs(X - 10 * MM) < 9.5 * MM) \
+            & (np.abs(Y - 10 * MM) < 9.5 * MM)
+        rel = f.dist[0][far] / exact[far] - 1
+        assert rel.max() < max_error and rel.min() > -0.01, (reach, rel.min(), rel.max())
 
+
+def test_longer_moves_only_shorten():
+    """Each move set contains the smaller ones, so distances can only drop
+    as the reach grows, and the same cells are reached."""
     p = df.NetPrimitives()
     p.num_layers = 1
-    p.polys = [(0, [square(0, 0, 20 * MM)])]
-    p.seed_discs = [(0, 10 * MM, 10 * MM, int(0.3 * MM))]
-    p.bbox = (0, 0, 20 * MM, 20 * MM)
-    f = df.solve(p, pitch)
-    xs = f.origin[0] + np.arange(f.nx) * pitch
-    ys = f.origin[1] + np.arange(f.ny) * pitch
-    X, Y = np.meshgrid(xs, ys)
-    exact = np.hypot(X - 10 * MM, Y - 10 * MM) - 0.3 * MM
-    far = np.isfinite(f.dist[0]) & (exact > 3 * MM) & (np.abs(X - 10 * MM) < 9.5 * MM) \
-        & (np.abs(Y - 10 * MM) < 9.5 * MM)
-    rel = f.dist[0][far] / exact[far] - 1
-    assert rel.max() < 0.03 and rel.min() > -0.01, (rel.min(), rel.max())
+    p.polys = [(0, [square(0, 0, 10 * MM), square(3 * MM, 3 * MM, 4 * MM)])]
+    p.segments = [(0, 10 * MM, 5 * MM, 25 * MM, 12 * MM, int(0.15 * MM))]
+    p.seed_discs = [(0, 1 * MM, 1 * MM, int(0.3 * MM))]
+    p.bbox = (0, 0, 25 * MM, 12 * MM)
+    fields = [df.solve(p, int(0.1 * MM), reach=r).dist for r in range(1, df.MAX_REACH + 1)]
+    for a, b in zip(fields, fields[1:]):
+        assert np.array_equal(np.isfinite(a), np.isfinite(b))
+        fin = np.isfinite(a)
+        assert (b[fin] <= a[fin] + 1e-6).all()
 
 
-def test_knight_moves_do_not_jump_gaps():
+def test_long_moves_do_not_jump_gaps():
     """Two parallel traces one cell apart, joined only at one end: the far end
-    of the second trace must be reached the long way round."""
+    of the second trace must be reached the long way round, whatever the
+    reach of the moves."""
     pitch = int(0.1 * MM)
     p = df.NetPrimitives()
     p.num_layers = 1
@@ -151,10 +192,11 @@ def test_knight_moves_do_not_jump_gaps():
                   (0, 10 * MM, 2 * pitch, 0, 2 * pitch, w)]
     p.sources = [(0, 0, 0)]
     p.bbox = (-MM, -MM, 11 * MM, MM)
-    f = df.solve(p, pitch)
-    ix = int(round((0 - f.origin[0]) / pitch))
-    iy = int(round((2 * pitch - f.origin[1]) / pitch))
-    assert f.dist[0, iy, ix] / MM > 19.0, f.dist[0, iy, ix] / MM
+    for reach in range(1, df.MAX_REACH + 1):
+        f = df.solve(p, pitch, reach=reach)
+        ix = int(round((0 - f.origin[0]) / pitch))
+        iy = int(round((2 * pitch - f.origin[1]) / pitch))
+        assert f.dist[0, iy, ix] / MM > 19.0, (reach, f.dist[0, iy, ix] / MM)
 
 
 def test_cancel():
@@ -188,12 +230,13 @@ def benchmark():
     p.sources = [(0, 0, 0)]
     p.bbox = (0, 0, 60 * MM, 40 * MM)
     pitch = df.pitch_for_budget(p.bbox, 2, 1_000_000, 50_000)
-    t = time.perf_counter()
-    f = df.solve(p, pitch)
-    dt = time.perf_counter() - t
-    cells = int(np.isfinite(f.dist).sum())
-    print("benchmark: %d copper cells @ %.3f mm in %.2f s (%.2f us/cell)"
-          % (cells, pitch / MM, dt, 1e6 * dt / max(1, cells)))
+    for reach in (2, df.MAX_REACH):
+        t = time.perf_counter()
+        f = df.solve(p, pitch, reach=reach)
+        dt = time.perf_counter() - t
+        cells = int(np.isfinite(f.dist).sum())
+        print("benchmark: %d copper cells @ %.3f mm, %d moves in %.2f s (%.2f us/cell)"
+              % (cells, pitch / MM, f.num_moves, dt, 1e6 * dt / max(1, cells)))
 
 
 if __name__ == "__main__":

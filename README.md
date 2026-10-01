@@ -1,12 +1,17 @@
 # Net Isoplot
 
-A KiCad plugin that shows a **live distance heatmap** of a net. Select a pad or
-via in the PCB editor, press the toolbar button, and a window opens that
+A KiCad plugin that shows a **live distance heatmap** of a net in a separate window. 
+
+## How to use it
+
+Select a pad or via in the PCB editor, press the toolbar button, and a window opens that
 colours every point of that net by its distance *measured along the copper*
 (traces, arcs, vias, pads and filled pours, across all layers joined by vias
 and plated holes). It runs red (hot) at the selection, cools through green, and
 ends in blue at the furthest points. It's a quick visual for spotting long
 return paths and loops.
+
+## Features 
 
 The window stays open beside KiCad and keeps up with your work:
 
@@ -67,14 +72,10 @@ Each module has a single job, and only one of them talks to KiCad:
 | File | Role |
 | --- | --- |
 | `isoplot.py` | Entry point KiCad launches (`plugin.json`). Single-instance handling, logging, starts the window. |
-| `live.py` | Background threads. The **poller** reads the selection 10×/s and re-reads the seed net about once a second. The IPC API has no change events, so a fingerprint of the net's items skips unchanged boards. The **solver** runs a coarse pass, then a fine one (small nets go straight to the fine one); a newer job cancels the current one. |
+| `live.py` | Background threads. The **poller** reads the selection 10×/s and re-reads the seed net about once a second. The IPC API has no change events, so a fingerprint of the net's items skips unchanged boards. The **solver** runs a quick pass (coarse grid on big nets, fine grid on small ones), then an accurate one on the fine grid with 48 moves per cell; a newer job cancels the current one. |
 | `kicad_source.py` | The only module that uses the KiCad API (`kipy`). It fetches the net's tracks, arcs, vias, pads (exact per-layer polygons from KiCad) and filled zones, tags each shape with the kind of item it came from (via, pad, zone), and honours unconnected-layer removal. It reads KiCad's version once per connection and derives the API features to use (`KiCadFeatures`): on KiCad 10.0.1+ it asks for just the seed net's items, older versions read the whole board. Output is plain primitives in nm. |
 | `distance_field.py` | KiCad-free core. Rasterises copper onto a multi-layer grid (NumPy) and finds shortest paths from the seed copper: NumPy passes across pours, a heap-based Dijkstra loop along thin traces. |
 | `viewer.py` | The wxPython window: heatmap, legend, layer toggles, via/pad visibility, cursor readout. The heatmap is rendered at screen resolution: copper edges come from the exact shapes (anti-aliased), and the colour comes from the distance grid, interpolated between cells. Where layers overlap, the one nearer the seed shows. |
-
-> **Why a separate window and not an on-canvas overlay?** Neither KiCad API
-> (SWIG in v9, IPC in v9–v11) can put pixel data onto the board canvas, so the
-> heatmap is drawn in its own window.
 
 ## Tests
 
@@ -93,10 +94,13 @@ zones (press **B**). Unfilled zones are reported in the status bar.
 
 ## Notes / limitations
 
-- Distance is a **grid geodesic** with 16 moves per cell (neighbours plus
-  knight's moves): slightly long, by up to about 2.8% depending on direction
-  (about 1% on average across a pour). Grid pitch adapts to the net's size:
-  0.05 mm on small nets, coarser on large pours.
+- Distance is a **grid geodesic**, so it runs slightly long depending on
+  direction. The view refines progressively: first 16 moves per cell
+  (neighbours plus knight's moves, up to 2.7% long, about 1.4% on average
+  across a pour; on a coarse grid for big nets), then 48 moves on the fine
+  grid, about three times slower (up to 0.75%, about 0.2% on average). The footer shows which one is on screen. Grid
+  pitch adapts to the net's size: 0.05 mm on small nets, coarser on large
+  pours.
 - Distances are measured from the edge of the selected copper, and via/hole
   transitions count as zero length.
 - Zone copper is only as current as the last zone fill.

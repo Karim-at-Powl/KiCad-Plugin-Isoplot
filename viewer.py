@@ -1063,8 +1063,8 @@ class IsoplotFrame(wx.Frame):
 
         # Net and furthest distance are in the legend; the footer adds the rest.
         seeds = "" if geometry.seed_count == 1 else "%d seeds      " % geometry.seed_count
-        self._summary = ("%sgrid %d x %d @ %.3f mm"
-                         % (seeds, field.nx, field.ny, field.pitch_nm / MM))
+        self._summary = ("%sgrid %d x %d @ %.3f mm, %d directions"
+                         % (seeds, field.nx, field.ny, field.pitch_nm / MM, field.num_moves))
         status = "solved in %.2f s" % seconds
         if not final:
             status += ", refining..."

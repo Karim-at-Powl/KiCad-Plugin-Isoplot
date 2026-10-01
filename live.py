@@ -7,10 +7,12 @@ Two daemon threads:
   net and hands changed geometry to the solver. The IPC API has no change
   notifications, so polling is the only option; a fingerprint of the net's
   items keeps unchanged boards from being re-solved.
-* the *solver* computes distance fields: for big nets a quick coarse pass first
-  so the view reacts immediately, then a fine pass (small nets get the fine
-  pass straight away). It also prepares the result for display, keeping that
-  work off the UI thread. A newer job cancels the one in progress.
+* the *solver* computes distance fields in two passes: a quick one so the view
+  reacts immediately (a coarse grid on big nets, the fine grid on small ones),
+  then the fine grid with longer moves, which is about three times slower but
+  cuts the distance error from ~2.7 % to ~0.75 %. Each pass replaces the view
+  as it finishes. The solver also prepares the result for display, keeping
+  that work off the UI thread. A newer job cancels the one in progress.
 
 Everything the UI sees goes through ``wx.CallAfter``.
 """
@@ -45,6 +47,10 @@ FINE_MIN_PITCH_NM = 50_000
 # Below this many (estimated) copper cells on the fine grid, the fine pass is
 # quick enough on its own; a coarse pass first would only add a redraw.
 COARSE_ABOVE_CELLS = 400_000
+# Move reach of the quick passes and of the last, more accurate one (see
+# distance_field.move_set: 16 and 48 moves).
+QUICK_REACH = 2
+FINAL_REACH = 4
 
 MM = 1e6
 
@@ -300,18 +306,23 @@ class _Solver:
         coarse = df.pitch_for_budget(prims.bbox, prims.num_layers, COARSE_CELLS,
                                      COARSE_MIN_PITCH_NM)
         big = df.copper_area(prims) / float(fine) ** 2 > COARSE_ABOVE_CELLS
-        passes = [coarse, fine] if big and coarse > 1.25 * fine else [fine]
-        for i, pitch in enumerate(passes):
+        # One quick pass for a first picture (coarse grid on big nets), then
+        # the accurate one on the fine grid.
+        if big and coarse > 1.25 * fine:
+            passes = [(coarse, QUICK_REACH), (fine, FINAL_REACH)]
+        else:
+            passes = [(fine, QUICK_REACH), (fine, FINAL_REACH)]
+        for i, (pitch, reach) in enumerate(passes):
             final = i == len(passes) - 1
-            self._post("set_status", "computing %s (grid %.2f mm)..."
-                       % (geometry.net_name, pitch / MM))
+            self._post("set_status", "computing %s (grid %.2f mm, %d directions)..."
+                       % (geometry.net_name, pitch / MM, len(df.move_set(reach))))
             t0 = time.perf_counter()
-            field = df.solve(prims, pitch, cancel=cancel)
+            field = df.solve(prims, pitch, cancel=cancel, reach=reach)
             display = viewer.prepare_layers(field)   # here, not on the UI thread
             elapsed = time.perf_counter() - t0
             if cancel():
                 return
-            log.info("solved %s @ %.3f mm in %.2f s (%.0f ms after the change was seen)",
-                     geometry.net_name, pitch / MM, elapsed,
+            log.info("solved %s @ %.3f mm, %d moves in %.2f s (%.0f ms after the change was seen)",
+                     geometry.net_name, pitch / MM, field.num_moves, elapsed,
                      (time.perf_counter() - geometry.changed_at) * 1e3)
             self._post("show_result", geometry, field, display, final, elapsed)
