@@ -118,8 +118,13 @@ class NetGeometry:
 
     def __init__(self, prims, layer_names, layer_colors, net_name, fingerprint,
                  seed_count, unfilled_zones, disc_kinds=None, poly_kinds=None,
-                 via_holes=None):
+                 via_holes=None, seed_ids=(), seed_shapes=()):
         self.prims = prims                  # distance_field.NetPrimitives
+        # The seeds found on the net, in the order asked for, and each one's
+        # own copper as (seed_discs, seed_polys) like prims.seed_* (whose
+        # union they are), for measuring from one seed at a time.
+        self.seed_ids = tuple(seed_ids)
+        self.seed_shapes = list(seed_shapes)
         # VIA / PAD / ZONE per prims.discs / prims.polys entry (same order).
         self.disc_kinds = disc_kinds or []
         self.poly_kinds = poly_kinds or []
@@ -162,6 +167,7 @@ class BoardReader:
         self._snapshot = None           # id -> item: all net items, as last read
         self._snapshot_due = 0.0        # when keep_snapshot_fresh() reads it again
         self._holes = None              # board_holes() of the snapshot, once worked out
+        self._refs = None               # pad id -> footprint reference (refresh_refs)
         self.stale = False              # the last fetch came from the snapshot
 
     @property
@@ -177,6 +183,47 @@ class BoardReader:
     def single_pad_selected(self):
         """True if the last selection read was one pad (see the class notes)."""
         return len(self._selected) == 1 and isinstance(next(iter(self._selected.values())), Pad)
+
+    def selected_items(self):
+        """The pads/vias of the last selection read, in KiCad's order."""
+        return list(self._selected.values())
+
+    def known_item(self, item_id):
+        """A pad/via by id from the last selection or the board snapshot, or
+        None (no request is made)."""
+        item = self._selected.get(item_id)
+        if item is None and self._snapshot is not None:
+            item = self._snapshot.get(item_id)
+        return item if isinstance(item, (Pad, Via)) else None
+
+    def label(self, item):
+        """A short name for a pad or via: "R12 pad 3", "Via at 12.30, 45.60 mm".
+        A pad whose footprint isn't known yet is "Pad 3" (see refresh_refs)."""
+        if isinstance(item, Via):
+            return "Via at %.2f, %.2f mm" % (item.position.x / 1e6, item.position.y / 1e6)
+        ref = (self._refs or {}).get(item.id.value)
+        number = item.number
+        if ref:
+            return "%s pad %s" % (ref, number) if number else "%s pad" % ref
+        return "Pad %s" % number if number else "Pad"
+
+    def needs_refs(self, items):
+        """True if a label of ``items`` lacks its footprint reference."""
+        refs = self._refs or {}
+        return any(isinstance(i, Pad) and i.id.value not in refs for i in items)
+
+    def refresh_refs(self):
+        """Re-read which footprint each pad belongs to, for the labels. False
+        if KiCad is busy (then try again later)."""
+        try:
+            footprints = self.board.get_footprints()
+        except ApiError as e:
+            if is_busy(e):
+                return False
+            raise
+        self._refs = {pad.id.value: fp.reference_field.text.value
+                      for fp in footprints for pad in fp.definition.pads}
+        return True
 
     def keep_snapshot_fresh(self, now=False):
         """Re-read the board snapshot if it is due (or ``now``). A busy KiCad
@@ -361,15 +408,20 @@ class BoardReader:
                         polys.append((lid, _rings(shape)))
                         poly_kinds.append(kind)
 
+        own = []                            # per seed: (its discs, its polys)
         for seed in seeds:
+            mine = ([], [])
             for lid in present.get(seed.id.value, []):
                 if isinstance(seed, Via):
-                    seed_discs.append((lid, seed.position.x, seed.position.y,
-                                       _via_diameter(seed, lid) / 2.0))
+                    mine[0].append((lid, seed.position.x, seed.position.y,
+                                    _via_diameter(seed, lid) / 2.0))
                 else:
                     shape = self.board.get_pad_shapes_as_polygons(seed, lid)
                     if shape is not None:
-                        seed_polys.append((lid, _rings(shape)))
+                        mine[1].append((lid, _rings(shape)))
+            seed_discs += mine[0]
+            seed_polys += mine[1]
+            own.append(mine)
 
         used = ({s[0] for s in segments} | {d[0] for d in discs}
                 | {p[0] for p in polys} | {d[0] for d in seed_discs}
@@ -394,13 +446,15 @@ class BoardReader:
             prims.layer_z = [heights[lid] for lid in layer_ids]
         holes = [drill + ([idx[lid] for lid in layers if lid in idx],)
                  for drill, layers in via_holes]
+        own = [([(idx[d[0]],) + d[1:] for d in discs_], [(idx[p[0]], p[1]) for p in polys_])
+               for discs_, polys_ in own]
 
         return NetGeometry(
             prims,
             [self._layer_name(lid) for lid in layer_ids],
             [_COPPER_RGB.get(canonical_name(lid), (180, 180, 180)) for lid in layer_ids],
             net, fingerprint, len(seeds), unfilled, disc_kinds, poly_kinds,
-            [h for h in holes if h[-1]])
+            [h for h in holes if h[-1]], [s.id.value for s in seeds], own)
 
     def copper_heights(self, copper):
         """Map copper layer id -> depth of the middle of its copper below the

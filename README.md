@@ -39,6 +39,28 @@ The window stays open beside KiCad and keeps up with your work:
   and pours underneath. Hidden copper still counts in the distances, and the
   selected copper stays marked in black.
 
+## Delta mode
+
+Switch **Isoplot / Delta** at the top right to compare two objects (pads, vias
+or one of each) on one net. Every point of the net is coloured by which of the
+two is nearer along the copper: red for object 1, blue for object 2, white
+where both are equally far. The colour gets deeper as the difference grows. The
+scale runs to the largest difference on the net, which is at most the
+distance between the two objects.
+
+- **Picking the two:** select them in KiCad one after the other, or both at
+  once. The legend names the objects it read in, and their own copper is
+  marked in a dark shade of their colour. Until both are picked, the view says
+  what to select next.
+- **Changing the pair:** a further selection replaces the object selected
+  longer ago, so the other one keeps its number and colour. Selecting one on
+  another net starts a new pair there. **Swap 1 and 2** exchanges them.
+  Untick *Follow selection* to keep the pair while you click around.
+- **Cursor readout:** the distance to the nearer object, and how much farther
+  the other one is.
+- Copper reached from only one of the two objects shows in that object's full
+  colour.
+
 While an interactive tool is active in KiCad (routing, placing a via,
 dragging...), KiCad answers every API request with "busy". The window says so
 and catches up as soon as you leave the tool (Esc).
@@ -73,10 +95,10 @@ Each module has a single job, and only one of them talks to KiCad:
 | File | Role |
 | --- | --- |
 | `isoplot.py` | Entry point KiCad launches (`plugin.json`). Single-instance handling, logging, starts the window. |
-| `live.py` | Background threads. The **poller** reads the selection 10×/s and re-reads the seed net about once a second. The IPC API has no change events, so a fingerprint of the net's items skips unchanged boards. The **solver** runs a quick pass (coarse grid on big nets, fine grid on small ones), then an accurate one on the fine grid with 48 moves per cell; a newer job cancels the current one. |
+| `live.py` | Background threads. The **poller** reads the selection 10×/s and re-reads the seed net about once a second. The IPC API has no change events, so a fingerprint of the net's items skips unchanged boards. The **solver** runs a quick pass (coarse grid on big nets, fine grid on small ones), then an accurate one on the fine grid with 48 moves per cell; a newer job cancels the current one. In delta mode the poller keeps the pair of objects (`SeedPair`) and the solver measures from each of them. |
 | `kicad_source.py` | The only module that uses the KiCad API (`kipy`). It fetches the net's tracks, arcs, vias, pads (exact per-layer polygons from KiCad) and filled zones, tags each shape with the kind of item it came from (via, pad, zone), and honours unconnected-layer removal. From the board stackup it works out how deep each copper layer sits (the middle of its copper), which sets the via lengths. It reads KiCad's version once per connection and derives the API features to use (`KiCadFeatures`): on KiCad 10.0.1+ it asks for just the seed net's items, older versions read the whole board. Output is plain primitives in nm. |
 | `distance_field.py` | KiCad-free core. Rasterises copper onto a multi-layer grid (NumPy) and finds shortest paths from the seed copper: NumPy passes across pours, a heap-based Dijkstra loop along thin traces. |
-| `viewer.py` | The wxPython window: heatmap, legend, layer toggles, via/pad visibility, cursor readout. The heatmap is rendered at screen resolution: copper edges come from the exact shapes (anti-aliased), and the colour comes from the distance grid, interpolated between cells. Where layers overlap, the one nearer the seed shows. |
+| `viewer.py` | The wxPython window: heatmap, legend, layer toggles, via/pad visibility, cursor readout. The heatmap is rendered at screen resolution: copper edges come from the exact shapes (anti-aliased), and the colour comes from the distance grid, interpolated between cells. Where layers overlap, the one nearer the seed shows. In delta mode a second channel per layer carries the difference between the two objects' distances, coloured on a red-white-blue scale. |
 
 ## Tests
 
@@ -84,6 +106,7 @@ Each module has a single job, and only one of them talks to KiCad:
 python tests/test_distance_field.py     # no dependencies beyond NumPy
 python tests/test_kicad_source.py       # needs kicad-python (no KiCad required)
 python tests/test_viewer.py             # needs wxPython (KiCad's bundled Python)
+python tests/test_live.py               # needs wxPython and kicad-python (the plugin's environment)
 ```
 
 ## Troubleshooting
@@ -109,3 +132,5 @@ zones (press **B**). Unfilled zones are reported in the status bar.
   selected pad/via itself is distance 0 on all its layers. If the stackup
   can't be read, vias count as zero length (noted in the log).
 - Zone copper is only as current as the last zone fill.
+- Delta mode solves the net once from each object, so it takes about twice as
+  long as an isoplot.

@@ -205,6 +205,157 @@ def test_board_view_draws_outline_and_messages():
         frame.Destroy()
 
 
+def _trace_pair():
+    """An 18 mm trace on layer 0 along y = 10 mm, object 1 a 1 mm disc at its
+    left end (x = 1 mm), object 2 at its right end (x = 19 mm)."""
+    p = df.NetPrimitives()
+    p.num_layers = 1
+    p.segments = [(0, 1 * MM, 10 * MM, 19 * MM, 10 * MM, 1 * MM)]
+    p.bbox = (0.5 * MM, 9.5 * MM, 19.5 * MM, 10.5 * MM)
+    fields = []
+    for x in (1, 19):
+        p.seed_discs = [(0, x * MM, 10 * MM, 0.5 * MM)]
+        fields.append(df.solve(p, 100_000))
+    return p, fields
+
+
+def _pixels(r, w=200, h=200):
+    """A Render's RGBA as viewport pixels (h, w, 4)."""
+    img = r.bitmap.ConvertToImage()
+    bw, bh = img.GetWidth(), img.GetHeight()
+    rgb = np.frombuffer(bytes(img.GetDataBuffer()), dtype=np.uint8).reshape(bh, bw, 3)
+    a = np.frombuffer(bytes(img.GetAlphaBuffer()), dtype=np.uint8).reshape(bh, bw, 1)
+    out = np.zeros((h, w, 4), dtype=np.uint8)
+    out[r.y:r.y + bh, r.x:r.x + bw] = np.concatenate([rgb, a], axis=2)[:h - r.y, :w - r.x]
+    return out
+
+
+def test_delta_colours_and_values():
+    """Nearer to 1: object 1's colour, the middle white, nearer to 2: object
+    2's colour; the readout values are the distance to the nearer object and
+    the difference."""
+    p, (f1, f2) = _trace_pair()
+    d = viewer.prepare_delta(f1, f2)
+    assert 16.5 * MM < d.scale < 18.5 * MM, d.scale      # seed edge to seed edge
+    heat = viewer.Heatmap(d.layers, f1.origin, f1.pitch_nm, f1.max_distance_nm, d.scale)
+    view = (200 / (20.0 * MM), (10.0 * MM, 10.0 * MM))   # 10 px per mm
+    r = viewer.render_heatmap(heat, [viewer.CopperShapes(p, 0)], view, 200, 200, block=2)
+    px = _pixels(r)[100]
+    red, blue = viewer.CHANNEL_RGB
+    assert px[30, 0] > 180 and px[30, 2] < 120, px[30]     # x = 3 mm: like object 1
+    assert px[170, 2] > 150 and px[170, 0] < 100, px[170]  # x = 17 mm: like object 2
+    assert px[100, :3].min() > 225, px[100]                # x = 10 mm: white
+    key, delta = r.values_at(50, 100)                      # x = 5 mm
+    assert abs(key - 3.5 * MM) < 0.3 * MM, key
+    assert abs(delta + 10 * MM) < 0.5 * MM, delta   # changes twice as fast
+    key, delta = r.values_at(150, 100)
+    assert abs(delta - 10 * MM) < 0.5 * MM, delta
+    assert r.values_at(100, 50) == (None, None)            # off copper
+    assert heat.sample_delta(5 * MM, 10 * MM)[1] < -9.5 * MM
+    lines = viewer._delta_readout(key, delta, d.scale)
+    assert lines == ["2 is nearer: %.2f mm" % (key / MM), "1 is %.2f mm farther" % (delta / MM)]
+    assert viewer._delta_readout(5 * MM, 0.001 * MM, d.scale)[1] == "Equal distance"
+
+
+def test_delta_over_overlapping_layers_is_the_difference_of_the_isoplots():
+    """Two poured layers joined by a via in the middle, object 1 on layer 0,
+    object 2 on layer 1. Each object's distance at a point is the nearest
+    over the layers there (as its isoplot shows), and the delta is their
+    difference: it has no seam where one layer becomes the nearer one."""
+    p = df.NetPrimitives()
+    p.num_layers = 2
+    p.polys = [(0, [square(0, 0, 20 * MM)]), (1, [square(0, 0, 20 * MM)])]
+    p.vias = [(10 * MM, 10 * MM, [0, 1])]
+    p.bbox = (0, 0, 20 * MM, 20 * MM)
+    fields = []
+    for li, x in ((0, 2), (1, 18)):
+        p.seed_discs = [(li, x * MM, 10 * MM, 0.5 * MM)]
+        fields.append(df.solve(p, 100_000))
+    f1, f2 = fields
+    d = viewer.prepare_delta(f1, f2)
+    heat = viewer.Heatmap(d.layers, f1.origin, f1.pitch_nm, f1.max_distance_nm, d.scale)
+    iso = [viewer.Heatmap(viewer.prepare_layers(f), f.origin, f.pitch_nm, f.max_distance_nm)
+           for f in fields]
+    view = (200 / (20.0 * MM), (10.0 * MM, 10.0 * MM))   # 10 px per mm
+    r = viewer.render_heatmap(heat, [viewer.CopperShapes(p, li) for li in (0, 1)],
+                              view, 200, 200, block=2)
+    for py in (31, 51, 151):
+        row = np.array([r.values_at(px, py)[1] for px in range(11, 190, 2)])
+        assert np.abs(np.diff(row)).max() < 0.5 * MM, (py, np.abs(np.diff(row)).max())
+        for px in range(11, 190, 20):
+            x, y = (px + 1 - 100) / 10.0 * MM + 10 * MM, (py + 1 - 100) / 10.0 * MM + 10 * MM
+            want = iso[0].sample(x, y) - iso[1].sample(x, y)
+            got = r.values_at(px, py)[1]
+            assert abs(got - want) < 0.2 * MM, (px, py, got / MM, want / MM)
+
+
+def test_delta_on_copper_reached_from_one_object_only():
+    """Copper only object 1 reaches counts as nearest to 1 (full colour), and
+    the readout says the other is not connected."""
+    p = df.NetPrimitives()
+    p.num_layers = 1
+    p.polys = [(0, [square(0, 0, 4 * MM)]), (0, [square(10 * MM, 0, 4 * MM)])]
+    p.bbox = (0, 0, 14 * MM, 4 * MM)
+    p.sources = [(0, 1 * MM, 1 * MM)]
+    f1 = df.solve(p, 100_000)
+    p.sources = [(0, 11 * MM, 1 * MM)]
+    f2 = df.solve(p, 100_000)
+    d = viewer.prepare_delta(f1, f2)
+    assert d.scale == 1.0                                  # never both: no scale
+    heat = viewer.Heatmap(d.layers, f1.origin, f1.pitch_nm, f1.max_distance_nm, d.scale)
+    key, delta = heat.sample_delta(3 * MM, 2 * MM)        # object 1's square only
+    assert delta == -viewer._ONE_SIDED and abs(key - 2.24 * MM) < 0.2 * MM, (key, delta)
+    assert heat.sample_delta(12 * MM, 2 * MM)[1] == viewer._ONE_SIDED
+    assert np.isnan(heat.sample_delta(7 * MM, 2 * MM)[0])  # between them: no copper
+    assert viewer._delta_readout(2 * MM, -2.0, 1.0) == ["2.00 mm to 1", "Not connected to 2"]
+
+
+class _FakeGeometry:
+    def __init__(self, prims, delta):
+        self.prims, self.delta = prims, delta
+        self.disc_kinds = ["via"] * len(prims.discs)
+        self.poly_kinds = []
+        self.via_holes = []
+        self.layer_names, self.layer_colors = ["F.Cu"], [(200, 52, 52)]
+        self.net_name = "SIG"
+        self.seed_count = 2
+        self.seed_shapes = [([(0, 1 * MM, 10 * MM, 0.5 * MM)], []),
+                            ([(0, 19 * MM, 10 * MM, 0.5 * MM)], [])]
+        self.unfilled_zones = 0
+
+
+def test_frame_switches_mode_and_shows_a_delta_result():
+    frame = viewer.IsoplotFrame()
+    try:
+        modes = []
+        frame.attach(type("S", (), {"set_mode": lambda self, d: modes.append(d)})())
+        p, (f1, f2) = _trace_pair()
+        frame._mode_delta.SetValue(True)
+        frame._on_mode(None)
+        assert modes == [True] and frame._delta
+        assert frame._view._board_colour == viewer._DELTA_BOARD_COLOUR
+        frame.set_channels(("R1 pad 1", None), "SIG")
+        assert frame._channel_text[0].GetLabel() == "1: R1 pad 1"
+        assert frame._channel_text[1].GetLabel() == "2: select a pad or via"
+        # An isoplot result arriving after the switch is dropped.
+        frame.show_result(_FakeGeometry(p, False), f1, viewer.prepare_layers(f1), True, 0.1)
+        assert frame._field is None
+        frame.show_result(_FakeGeometry(p, True), f1, viewer.prepare_delta(f1, f2), True, 0.1)
+        heat = frame._view._heat
+        assert heat is not None and heat.delta
+        assert frame._delta_top.GetLabel().endswith("mm  (1 nearer)")
+        seeds = frame._view._seeds
+        assert [rgb for rgb, _ in seeds] == list(viewer._DELTA_SEED_RGB)
+        frame.set_note("Delta mode compares two pads/vias; 3 are selected.")
+        assert "3 are selected" in frame.GetStatusBar().GetStatusText()
+        frame._mode_iso.SetValue(True)
+        frame._on_mode(None)
+        assert modes == [True, False] and frame._view._heat is None
+        assert "3 are selected" not in frame.GetStatusBar().GetStatusText()
+    finally:
+        frame.Destroy()
+
+
 if __name__ == "__main__":
     app = wx.App(False)
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

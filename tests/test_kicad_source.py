@@ -224,6 +224,49 @@ def test_via_lengths_from_the_stackup():
     assert abs(gain - 1_545_000) < 1, gain
 
 
+def test_each_seed_keeps_its_own_copper():
+    """Delta mode measures from one seed at a time: the geometry lists the
+    seeds in the order asked for, each with its own seed shapes."""
+    g = ks.BoardReader(board_fixture()).fetch(("v1", "pad1", "gone"))
+    assert g.seed_ids == ("v1", "pad1") and g.seed_count == 2
+    (via_discs, via_polys), (pad_discs, pad_polys) = g.seed_shapes
+    assert [d[0] for d in via_discs] == [0, 1] and not via_polys
+    assert not pad_discs and [p[0] for p in pad_polys] == [0]
+    assert sorted(via_discs + pad_discs) == sorted(g.prims.seed_discs)
+    assert len(pad_polys) == len(g.prims.seed_polys)
+
+
+def test_labels_name_the_footprint_once_known():
+    from types import SimpleNamespace as NS
+    board = board_fixture()
+    pad, v = board.items[0], board.items[2]
+    reader = ks.BoardReader(board)
+    assert reader.label(v) == "Via at 20.00, 0.00 mm"
+    pad.proto.number = "3"
+    assert reader.label(pad) == "Pad 3" and reader.needs_refs([pad, v])
+    busy = [True]
+
+    def get_footprints():
+        if busy[0]:
+            raise ApiError("busy", code=ApiStatusCode.AS_BUSY)
+        return [NS(reference_field=NS(text=NS(value="R12")), definition=NS(pads=[pad]))]
+
+    board.get_footprints = get_footprints
+    assert not reader.refresh_refs()                # busy: try again later
+    busy[0] = False
+    assert reader.refresh_refs()
+    assert reader.label(pad) == "R12 pad 3" and not reader.needs_refs([pad, v])
+    pad.proto.number = ""
+    assert reader.label(pad) == "R12 pad"
+    # Items are found by id from the selection or the snapshot, without a request.
+    board.selection = ("pad1",)
+    reader.selected_seed_ids()
+    assert reader.known_item("pad1") is pad and reader.known_item("v1") is None
+    reader.keep_snapshot_fresh(now=True)
+    assert reader.known_item("v1") is v and reader.known_item("t1") is None
+    assert reader.selected_items() == [pad]
+
+
 def test_stackup_edits_and_refusals():
     board = board_fixture()
     reader = ks.BoardReader(board)
