@@ -55,6 +55,10 @@ class NetPrimitives:
         sources:  list of (layer, x, y) seed points (distance 0).
         seed_discs: list of (layer, cx, cy, radius) seed copper (distance 0).
         seed_polys: list of (layer, [ring, ...]) seed copper (distance 0).
+        layer_z:  height of each layer in the board stack, in nm (one entry
+                  per layer), or None. Going through a via from one layer to
+                  another costs the difference of their heights; with None
+                  it costs nothing.
     """
 
     def __init__(self):
@@ -67,6 +71,7 @@ class NetPrimitives:
         self.sources = []
         self.seed_discs = []
         self.seed_polys = []
+        self.layer_z = None
 
 
 class DistanceField:
@@ -376,16 +381,42 @@ def solve(prims, pitch_nm, margin_nm=None, cancel=None, reach=REACH,
     def gidx(li, ix, iy):
         return li * stride + (iy + pad) * nxp + (ix + pad)
 
-    groups = [[gidx(li, ix, iy) for li in layers] for (ix, iy, layers) in via_cells]
+    links = _via_links(via_cells, gidx, prims.layer_z, L)
     li_s, iy_s, ix_s = np.nonzero(seed_masks)
     seeds = gidx(li_s, ix_s, iy_s)
 
     steps, allow = _moves(padded, pad, moves, float(pitch_nm))
-    dist = _search(allow, seeds, steps, groups, cancel, to_heap, to_vector,
+    dist = _search(allow, seeds, steps, links, cancel, to_heap, to_vector,
                    delta_cells * pitch_nm)
     arr = dist.reshape(L, nyp, nxp)[:, pad:-pad, pad:-pad]
     return DistanceField(nx, ny, L, pitch_nm, origin, np.ascontiguousarray(arr),
                          num_moves=len(moves))
+
+
+def _via_links(via_cells, gidx, layer_z, num_layers):
+    """The vias' links between layers as (from, to, length) arrays over the
+    flat padded grid, sorted by ``from``.
+
+    A via links each of its layers to the next one up and down the stack, at
+    the height difference of the two (zero without ``layer_z``). Longer trips
+    chain these, which adds up to the same height difference, with the
+    layers in between passed on the way (where the via may join them).
+    """
+    z = list(layer_z) if layer_z is not None else [0.0] * num_layers
+    if len(z) != num_layers:
+        raise ValueError("layer_z needs one height per layer")
+    src, dst, cost = [], [], []
+    for (ix, iy, layers) in via_cells:
+        layers = sorted(layers, key=lambda li: z[li])
+        for a, b in zip(layers, layers[1:]):
+            ga, gb = gidx(a, ix, iy), gidx(b, ix, iy)
+            c = abs(float(z[b]) - float(z[a]))
+            src += (ga, gb)
+            dst += (gb, ga)
+            cost += (c, c)
+    order = np.argsort(np.asarray(src, dtype=np.int64), kind="stable")
+    return (np.asarray(src, dtype=np.int64)[order], np.asarray(dst, dtype=np.int64)[order],
+            np.asarray(cost, dtype=np.float64)[order])
 
 
 # A move is one step (dx, dy) of the search. With reach r the moves are every
@@ -476,11 +507,12 @@ def _moves(padded, pad, moves, pitch):
     return steps, allow
 
 
-def _search(allow_np, seeds, steps, groups, cancel, to_heap, to_vector, delta):
+def _search(allow_np, seeds, steps, links, cancel, to_heap, to_vector, delta):
     """Shortest distances over the flat padded grid from ``seeds`` (distance 0).
 
-    ``allow_np`` holds each cell's allowed moves (see _moves). ``groups`` lists
-    cells joined at zero cost (a via or plated hole across its layers).
+    ``allow_np`` holds each cell's allowed moves (see _moves). ``links`` are
+    the extra moves of the vias and plated holes between layers, as
+    (from, to, length) arrays sorted by ``from`` (see _via_links).
     Label-correcting: every cell whose distance dropped stays pending until its
     moves have been relaxed, so the result is exact whichever strategy handled
     which part. The heap loop works on Python ``array`` objects (fast scalar
@@ -503,12 +535,12 @@ def _search(allow_np, seeds, steps, groups, cancel, to_heap, to_vector, delta):
              np.array([c for _, c in steps], dtype=np.float64),
              allow_np.view(np.uint8).reshape(n, 8)[:, :nbytes])
 
-    links = {}  # cell -> other-layer cells of its via (heap loop)
-    for cells in groups:
-        for g in cells:
-            links.setdefault(g, set()).update(h for h in cells if h != g)
-    via_cells = np.array([g for cells in groups for g in cells], dtype=np.int64)
-    via_group = np.repeat(np.arange(len(groups)), [len(c) for c in groups])
+    jumps = {}  # cell -> [(other-layer cell, length), ...] of its vias (heap loop)
+    for g, h, c in zip(*(a.tolist() for a in links)):
+        jumps.setdefault(g, []).append((h, c))
+    is_via = np.zeros(n, dtype=bool)    # NumPy passes: which cells have links
+    is_via[links[0]] = True
+    links = links + (is_via,)
 
     pending = np.unique(seeds.astype(np.int64))
     heap = None
@@ -520,7 +552,7 @@ def _search(allow_np, seeds, steps, groups, cancel, to_heap, to_vector, delta):
     passes = 0
     while True:
         if heap is not None:
-            if not _heap_run(heap, dist, allow, tables, links.get, to_vector, cancel):
+            if not _heap_run(heap, dist, allow, tables, jumps.get, to_vector, cancel):
                 break  # heap drained: done
             pending = np.unique(np.fromiter(
                 (g for d, g in heap if d == dist[g]), dtype=np.int64))
@@ -540,8 +572,7 @@ def _search(allow_np, seeds, steps, groups, cancel, to_heap, to_vector, delta):
         # seed would then be improved over and over.
         d = dist_np[pending]
         now = d < d.min() + delta
-        improved = _wave_pass(pending[now], dist_np, moves,
-                              via_cells, via_group, len(groups))
+        improved = _wave_pass(pending[now], dist_np, moves, links)
         pending = _unique(np.concatenate([pending[~now], improved]), slot)
     return dist_np
 
@@ -558,10 +589,11 @@ def _unique(cells, slot):
 _BYTE_FLAGS = ((np.arange(256)[:, None] >> np.arange(8)) & 1).astype(bool)
 
 
-def _wave_pass(active, dist, moves, via_cells, via_group, n_groups):
+def _wave_pass(active, dist, moves, links):
     """Relax every allowed move of every given cell at once (as one cells x
-    moves array, so a pass costs a handful of NumPy calls); returns the cells
-    whose distance dropped (may contain duplicates)."""
+    moves array, so a pass costs a handful of NumPy calls), then the via
+    links leaving them; returns the cells whose distance dropped (may contain
+    duplicates)."""
     offsets, lengths, allow_bytes = moves
     on = _BYTE_FLAGS[allow_bytes[active]].reshape(active.size, -1)[:, :offsets.size]
     hit = (active[:, None] + offsets)[on]
@@ -569,14 +601,23 @@ def _wave_pass(active, dist, moves, via_cells, via_group, n_groups):
     better = nd < dist[hit]
     hit = hit[better]
     np.minimum.at(dist, hit, nd[better])
-    if n_groups:
-        best = np.full(n_groups, np.inf)
-        np.minimum.at(best, via_group, dist[via_cells])
-        joined = best[via_group]
-        lower = joined < dist[via_cells]
-        if lower.any():
-            dist[via_cells[lower]] = joined[lower]
-            hit = np.concatenate([hit, via_cells[lower]])
+    src, dst, cost, is_via = links
+    if src.size:
+        at = active[is_via[active]]
+        if at.size:
+            # Expand each active via cell into its links: link indices
+            # lo, lo+1, ..., lo+n-1 per cell.
+            lo = np.searchsorted(src, at, "left")
+            n = np.searchsorted(src, at, "right") - lo
+            first = np.cumsum(n) - n
+            e = np.repeat(lo - first, n) + np.arange(int(n.sum()))
+            to = dst[e]
+            nd = dist[np.repeat(at, n)] + cost[e]
+            better = nd < dist[to]
+            if better.any():
+                to = to[better]
+                np.minimum.at(dist, to, nd[better])
+                hit = np.concatenate([hit, to])
     return hit
 
 
@@ -602,10 +643,11 @@ def _heap_run(heap, dist, allow, tables, get_links, to_vector, cancel):
                     push(heap, (nd, h))
         joined = get_links(g)
         if joined:
-            for h in joined:
-                if d < dist[h]:
-                    dist[h] = d
-                    push(heap, (d, h))
+            for h, cost in joined:
+                nd = d + cost
+                if nd < dist[h]:
+                    dist[h] = nd
+                    push(heap, (nd, h))
         popped += 1
         if not popped & 0xFF:
             if len(heap) > to_vector:

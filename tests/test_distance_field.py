@@ -40,6 +40,44 @@ def test_L_net_across_via():
     assert np.isfinite(f.dist[1]).sum() > 50, "via did not bridge to layer 1"
 
 
+def _via_net(num_layers, via_layers, layer_z):
+    """A 10 mm trace on layer 0 to a via, then a 5 mm trace on each other
+    layer of the via."""
+    p = df.NetPrimitives()
+    p.num_layers = num_layers
+    w = int(0.25 * MM)
+    p.segments = [(0, 0, 0, 10 * MM, 0, w)]
+    p.segments += [(li, 10 * MM, 0, 15 * MM, 0, w) for li in via_layers if li]
+    p.vias = [(10 * MM, 0, list(via_layers))]
+    p.sources = [(0, 0, 0)]
+    p.bbox = (-1 * MM, -1 * MM, 16 * MM, 1 * MM)
+    p.layer_z = layer_z
+    return p
+
+
+def test_via_length_from_stackup():
+    """Through the via, each layer is farther by its height difference from
+    the layer the path came in on."""
+    pitch = int(0.1 * MM)
+    flat = df.solve(_via_net(3, [0, 1, 2], None), pitch)
+    z = [0.0, 0.2 * MM, 1.6 * MM]
+    tall = df.solve(_via_net(3, [0, 1, 2], z), pitch)
+    assert np.array_equal(flat.dist[0], tall.dist[0])   # entry layer untouched
+    for li in (1, 2):
+        fin = np.isfinite(flat.dist[li])
+        assert np.allclose(tall.dist[li][fin] - flat.dist[li][fin], z[li]), li
+    # The heights decide the order, not the layer numbers (here 2 sits
+    # between 0 and 1), and a skipped layer is only passed through.
+    z = [0.0, 1.6 * MM, 0.2 * MM]
+    f = df.solve(_via_net(3, [0, 1, 2], z), pitch)
+    fin = np.isfinite(flat.dist[1])
+    assert np.allclose(f.dist[1][fin] - flat.dist[1][fin], 1.6 * MM)
+    f = df.solve(_via_net(4, [0, 3], [0.0, 0.5 * MM, 1.0 * MM, 1.5 * MM]), pitch)
+    fin = np.isfinite(flat.dist[1])
+    assert np.allclose(f.dist[3][fin] - flat.dist[1][fin], 1.5 * MM)
+    assert not np.isfinite(f.dist[1]).any() and not np.isfinite(f.dist[2]).any()
+
+
 def test_square_polygon():
     """10 mm filled square, source near one corner: furthest ~12.7 mm."""
     p = df.NetPrimitives()
@@ -96,7 +134,7 @@ def test_search_strategies_agree():
     p.seed_discs = [(0, 1 * MM, 1 * MM, int(0.4 * MM))]
     p.bbox = (0, 0, 31 * MM, 21 * MM)
     pitch = int(0.1 * MM)
-    for reach in (2, df.MAX_REACH):
+    for reach, p.layer_z in ((2, None), (df.MAX_REACH, None), (2, [0.0, 1.6 * MM])):
         ref = df.solve(p, pitch, reach=reach, to_heap=10 ** 9, to_vector=10 ** 9).dist
         for th, tv in ((0, 0), (df.TO_HEAP, df.TO_VECTOR), (4, 8)):
             got = df.solve(p, pitch, reach=reach, to_heap=th, to_vector=tv).dist

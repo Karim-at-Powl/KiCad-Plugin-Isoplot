@@ -10,9 +10,10 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from kipy.board_types import BoardArc, BoardCircle, BoardSegment, Pad, Track, Via, Zone
+from kipy.board import BoardStackup
 from kipy.errors import ApiError
 from kipy.geometry import PolygonWithHoles, Vector2
-from kipy.proto.board import board_types_pb2 as bt
+from kipy.proto.board import board_pb2, board_types_pb2 as bt
 from kipy.proto.board.board_types_pb2 import BoardLayer
 from kipy.proto.common import ApiStatusCode
 from kipy.proto.common.types import base_types_pb2 as base
@@ -96,8 +97,27 @@ def zone(uid, net, layer, rect, filled=True):
     return Zone(proto=z)
 
 
+def stackup(*entries):
+    """A BoardStackup from (type, board layer, thickness in um[, enabled])."""
+    proto = board_pb2.BoardStackup()
+    for kind, lid, um, *enabled in entries:
+        layer = proto.layers.add()
+        layer.type, layer.layer = kind, lid
+        layer.thickness.value_nm = int(um * 1000)
+        layer.enabled = enabled[0] if enabled else True
+    return BoardStackup(proto)
+
+
+T = board_pb2.BoardStackupLayerType
+# A 1.6 mm two-layer board: the copper mid-planes are 1.545 mm apart.
+TWO_LAYER = ((T.BSLT_SOLDERMASK, BoardLayer.BL_F_Mask, 10), (T.BSLT_COPPER, F, 35),
+             (T.BSLT_DIELECTRIC, BoardLayer.BL_UNDEFINED, 1510), (T.BSLT_COPPER, B, 35),
+             (T.BSLT_SOLDERMASK, BoardLayer.BL_B_Mask, 10))
+
+
 class FakeBoard:
     name = "fake.kicad_pcb"
+    stackup = TWO_LAYER
 
     def __init__(self, items, selection=()):
         self.items = items
@@ -109,6 +129,11 @@ class FakeBoard:
 
     def get_items(self, types):
         return list(self.items)
+
+    def get_stackup(self):
+        if isinstance(self.stackup, ApiError):
+            raise self.stackup
+        return stackup(*self.stackup)
 
     def get_selection(self, types):
         return [i for i in self.items if i.id.value in self.selection]
@@ -177,6 +202,49 @@ def test_selection_and_fetch():
     far = f.max_distance_nm / MM
     # pad edge (1 mm) -> 20 mm -> via -> ~14 mm down to the far pour edge
     assert 30.0 < far < 36.0, far
+
+
+def test_via_lengths_from_the_stackup():
+    """Each copper layer sits at the middle of its copper in the stack; mask
+    and silk don't count. ``enabled`` is ignored: KiCad 9.0.5 sends False
+    for every layer."""
+    board = board_fixture()
+    p = ks.BoardReader(board).fetch(("pad1",)).prims
+    assert p.layer_z == [17_500, 1_562_500], p.layer_z
+    board.stackup = ((T.BSLT_COPPER, F, 35), (T.BSLT_DIELECTRIC, 0, 200),
+                     (T.BSLT_COPPER, IN1, 35, False), (T.BSLT_DIELECTRIC, 0, 1000),
+                     (T.BSLT_DIELECTRIC, 0, 500, False), (T.BSLT_COPPER, B, 35))
+    assert ks.BoardReader(board).copper_heights([F, IN1, B]) == {
+        F: 17_500, IN1: 252_500, B: 1_787_500}
+    # The via now costs the board's thickness: farther than without.
+    flat = df.NetPrimitives()
+    flat.__dict__.update(p.__dict__, layer_z=None)
+    pitch = int(0.1 * MM)
+    gain = df.solve(p, pitch).max_distance_nm - df.solve(flat, pitch).max_distance_nm
+    assert abs(gain - 1_545_000) < 1, gain
+
+
+def test_stackup_edits_and_refusals():
+    board = board_fixture()
+    reader = ks.BoardReader(board)
+    g = reader.fetch(("pad1",))
+    assert reader.fetch(("pad1",), g.fingerprint) is None
+    # A thicker board is a change to solve again.
+    board.stackup = TWO_LAYER[:2] + ((T.BSLT_DIELECTRIC, 0, 800),) + TWO_LAYER[3:]
+    g = reader.fetch(("pad1",), g.fingerprint)
+    assert g is not None and g.prims.layer_z == [17_500, 852_500], g.prims.layer_z
+    # Busy: the last stackup holds.
+    board.stackup = ApiError("busy", code=ApiStatusCode.AS_BUSY)
+    assert reader.fetch(("pad1",), g.fingerprint) is None
+    # A stackup missing a copper layer, or a KiCad refusing the query: vias
+    # count as zero length, as before.
+    board.stackup = TWO_LAYER[:2]
+    assert ks.BoardReader(board).fetch(("pad1",)).prims.layer_z is None
+    board.stackup = ApiError("unhandled", code=ApiStatusCode.AS_UNHANDLED)
+    reader = ks.BoardReader(board)
+    assert reader.fetch(("pad1",)).prims.layer_z is None
+    board.stackup = TWO_LAYER
+    assert reader.fetch(("pad1",)).prims.layer_z is None   # not asked again
 
 
 def test_discs_and_polys_are_tagged_with_their_item_kind():

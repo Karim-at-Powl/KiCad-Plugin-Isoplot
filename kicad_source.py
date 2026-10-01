@@ -11,6 +11,8 @@ oval, trapezoid, chamfered, custom) and per-layer padstacks come out exact.
 Vias and pads only count on the layers where KiCad actually flashes copper
 (unconnected-layer removal is honoured). Every disc and polygon is tagged with
 the kind of item it came from, so the viewer can hide the vias or pads.
+The board stackup gives each copper layer's depth, so going through a via
+costs the distance between its layers.
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ import time
 from kipy.board_types import (ArcTrack, BoardArc, BoardBezier, BoardCircle, BoardPolygon,
                               BoardRectangle, BoardSegment, Pad, Track, Via, Zone)
 from kipy.errors import ApiError
+from kipy.proto.board.board_pb2 import BoardStackupLayerType
 from kipy.proto.board.board_types_pb2 import (BoardLayer, DrillShape, PadStackType, PadType,
                                              ZoneType)
 from kipy.proto.common import ApiStatusCode
@@ -151,6 +154,9 @@ class BoardReader:
         self._have_layer_names = self.features.layer_names
         self._have_net_queries = self.features.net_queries   # fetch just the seed net
         self._have_presence = self.features.padstack_presence
+        self._have_stackup = True
+        self._heights = None            # copper_heights() as last read
+        self._stackup_warned = False
         self._clock = clock
         self._selected = {}             # id -> Pad/Via, as last read from the selection
         self._snapshot = None           # id -> item: all net items, as last read
@@ -231,6 +237,7 @@ class BoardReader:
         """
         copper = sorted((lid for lid in self.board.get_enabled_layers()
                          if lid in _STACK_POS), key=_STACK_POS.get)
+        heights = self.copper_heights(copper)
         try:
             found = self._seed_net_items(seed_ids) if self._have_net_queries else None
             if found is None:
@@ -245,10 +252,10 @@ class BoardReader:
 
         by_id = {i.id.value: i for i in net_items if isinstance(i, (Pad, Via))}
         seeds = [by_id[s] for s in seed_ids if s in by_id]
-        fingerprint = _fingerprint(net_items, seeds, copper)
+        fingerprint = _fingerprint(net_items, seeds, copper, heights)
         if fingerprint == previous_fingerprint:
             return None
-        return self._convert(net, net_items, seeds, copper, fingerprint)
+        return self._convert(net, net_items, seeds, copper, heights, fingerprint)
 
     def _seed_net_items(self, seed_ids):
         """(net, items on it) through the per-item and per-net queries of
@@ -293,7 +300,7 @@ class BoardReader:
         return net, [i for i in items if _net_name(i) == net]
 
     # -- conversion ---------------------------------------------------------
-    def _convert(self, net, items, seeds, copper, fingerprint):
+    def _convert(self, net, items, seeds, copper, heights, fingerprint):
         on_board = set(copper)
         padstacks = [i for i in items if isinstance(i, (Pad, Via))]
         present = self._presence(padstacks, copper)
@@ -383,6 +390,8 @@ class BoardReader:
             if len(mapped) >= 2:
                 prims.vias.append((x, y, mapped))
         prims.bbox = _bbox(prims)
+        if heights:
+            prims.layer_z = [heights[lid] for lid in layer_ids]
         holes = [drill + ([idx[lid] for lid in layers if lid in idx],)
                  for drill, layers in via_holes]
 
@@ -392,6 +401,40 @@ class BoardReader:
             [_COPPER_RGB.get(canonical_name(lid), (180, 180, 180)) for lid in layer_ids],
             net, fingerprint, len(seeds), unfilled, disc_kinds, poly_kinds,
             [h for h in holes if h[-1]])
+
+    def copper_heights(self, copper):
+        """Map copper layer id -> depth of the middle of its copper below the
+        top of the stack (nm), from the board stackup, for the via lengths.
+        None if the stackup can't be read or misses one of ``copper`` (vias
+        then count as zero length). While KiCad is busy the last answer is
+        kept."""
+        if not self._have_stackup:
+            return None
+        try:
+            stackup = self.board.get_stackup()
+        except ApiError as e:
+            if is_busy(e):
+                return self._heights
+            log.info("%s refused the board stackup query (%s); vias count as zero length",
+                     self.features.description, e)
+            self._have_stackup = False
+            return None
+        # Every layer's ``enabled`` reads False on KiCad 9.0.5, so it isn't
+        # used: the stackup only lists the board's layers anyway.
+        heights, depth = {}, 0
+        for layer in stackup.layers:
+            if layer.type == BoardStackupLayerType.BSLT_COPPER:
+                heights[layer.layer] = depth + layer.thickness / 2.0
+            elif layer.type != BoardStackupLayerType.BSLT_DIELECTRIC:
+                continue                # mask, silk, paste: outside the copper
+            depth += layer.thickness
+        if any(lid not in heights for lid in copper):
+            if not self._stackup_warned:
+                log.warning("the board stackup misses copper layers; vias count as zero length")
+                self._stackup_warned = True
+            heights = None
+        self._heights = heights
+        return heights
 
     def _presence(self, items, copper):
         """Map item id -> copper layers (stack order) where it has copper."""
@@ -444,9 +487,10 @@ def _net_name(item):
     return item.net.name
 
 
-def _fingerprint(items, seeds, copper):
+def _fingerprint(items, seeds, copper, heights=None):
     h = hashlib.blake2b(digest_size=16)
     h.update(bytes(str(copper), "ascii"))
+    h.update(bytes(str(sorted(heights.items()) if heights else None), "ascii"))
     for s in seeds:
         h.update(s.id.value.encode())
     for item in items:
