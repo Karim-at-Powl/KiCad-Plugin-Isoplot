@@ -9,7 +9,8 @@ and colours the viewer needs.
 Pads use KiCad's own polygon for each layer, so every pad shape (round rect,
 oval, trapezoid, chamfered, custom) and per-layer padstacks come out exact.
 Vias and pads only count on the layers where KiCad actually flashes copper
-(unconnected-layer removal is honoured).
+(unconnected-layer removal is honoured). Every disc and polygon is tagged with
+the kind of item it came from, so the viewer can hide the vias or pads.
 """
 
 from __future__ import annotations
@@ -22,7 +23,8 @@ import time
 from kipy.board_types import (ArcTrack, BoardArc, BoardBezier, BoardCircle, BoardPolygon,
                               BoardRectangle, BoardSegment, Pad, Track, Via, Zone)
 from kipy.errors import ApiError
-from kipy.proto.board.board_types_pb2 import BoardLayer, PadStackType, ZoneType
+from kipy.proto.board.board_types_pb2 import (BoardLayer, DrillShape, PadStackType, PadType,
+                                             ZoneType)
 from kipy.proto.common import ApiStatusCode
 from kipy.proto.common.types import KIID, KiCadObjectType
 from kipy.util.board_layer import canonical_name, iter_copper_layers
@@ -40,6 +42,11 @@ _NET_ITEM_TYPES = [KiCadObjectType.KOT_PCB_TRACE, KiCadObjectType.KOT_PCB_ARC,
                    KiCadObjectType.KOT_PCB_ZONE]
 _SEED_TYPES = [KiCadObjectType.KOT_PCB_PAD, KiCadObjectType.KOT_PCB_VIA]
 _COPPER_ZONES = (ZoneType.ZT_COPPER, ZoneType.ZT_TEARDROP)
+
+# What a disc or polygon of NetGeometry came from (NetGeometry.*_kinds):
+# a via, an SMD pad, a through-hole pad (its drill is drawn with the board) or
+# a zone.
+VIA, PAD, THT, ZONE = "via", "pad", "tht", "zone"
 
 _ARC_SEG_NM = 100_000   # max chord length when sampling arcs
 _SNAPSHOT_S = 3.0       # re-read the board snapshot at most this often ...
@@ -107,8 +114,15 @@ class NetGeometry:
     """Everything the solver and viewer need about one net (plain data)."""
 
     def __init__(self, prims, layer_names, layer_colors, net_name, fingerprint,
-                 seed_count, unfilled_zones):
+                 seed_count, unfilled_zones, disc_kinds=None, poly_kinds=None,
+                 via_holes=None):
         self.prims = prims                  # distance_field.NetPrimitives
+        # VIA / PAD / ZONE per prims.discs / prims.polys entry (same order).
+        self.disc_kinds = disc_kinds or []
+        self.poly_kinds = poly_kinds or []
+        # The vias' drills, for drawing: (x, y, width, height, angle in degrees,
+        # [dense layer, ...]). Pad drills belong to the board (board_holes()).
+        self.via_holes = via_holes or []
         self.layer_names = layer_names      # dense index -> str
         self.layer_colors = layer_colors    # dense index -> (r, g, b)
         self.net_name = net_name
@@ -141,6 +155,7 @@ class BoardReader:
         self._selected = {}             # id -> Pad/Via, as last read from the selection
         self._snapshot = None           # id -> item: all net items, as last read
         self._snapshot_due = 0.0        # when keep_snapshot_fresh() reads it again
+        self._holes = None              # board_holes() of the snapshot, once worked out
         self.stale = False              # the last fetch came from the snapshot
 
     @property
@@ -157,10 +172,10 @@ class BoardReader:
         """True if the last selection read was one pad (see the class notes)."""
         return len(self._selected) == 1 and isinstance(next(iter(self._selected.values())), Pad)
 
-    def keep_snapshot_fresh(self):
-        """Re-read the board snapshot if it is due. A busy KiCad is skipped
-        silently (the snapshot is what covers for it)."""
-        if self._clock() < self._snapshot_due:
+    def keep_snapshot_fresh(self, now=False):
+        """Re-read the board snapshot if it is due (or ``now``). A busy KiCad
+        is skipped silently (the snapshot is what covers for it)."""
+        if not now and self._clock() < self._snapshot_due:
             return
         try:
             self._read_board_items()
@@ -174,7 +189,25 @@ class BoardReader:
         now = self._clock()
         self._snapshot = {i.id.value: i for i in items}
         self._snapshot_due = now + max(_SNAPSHOT_S, _SNAPSHOT_DUTY * (now - t0))
+        self._holes = None
         return items
+
+    def board_holes(self):
+        """The drills of all the board's pads (through-hole and non-plated,
+        any net) as a sorted tuple of (x, y, width, height, angle in degrees),
+        or None before the first snapshot.
+
+        They come from the board snapshot, which is read on every KiCad
+        version anyway, so they cost no extra request and follow edits within
+        a few seconds. Vias are not included: they are drawn with their net.
+        """
+        if self._snapshot is None:
+            return None
+        if self._holes is None:
+            drills = (_drill(i) for i in self._snapshot.values()
+                      if isinstance(i, Pad) and i.pad_type in (PadType.PT_PTH, PadType.PT_NPTH))
+            self._holes = tuple(sorted(d for d in drills if d))
+        return self._holes
 
     def board_outline(self):
         """The board's Edge.Cuts as (fingerprint, closed rings, open chains).
@@ -267,6 +300,8 @@ class BoardReader:
         pads = [i for i in items if isinstance(i, Pad)]
 
         segments, discs, polys, vias = [], [], [], []
+        disc_kinds, poly_kinds = [], []     # parallel to discs / polys
+        via_holes = []                      # (drill, layers)
         seed_discs, seed_polys = [], []
         unfilled = 0
 
@@ -287,8 +322,12 @@ class BoardReader:
                 pos = item.position
                 for lid in layers:
                     discs.append((lid, pos.x, pos.y, _via_diameter(item, lid) / 2.0))
+                    disc_kinds.append(VIA)
                 if len(layers) >= 2:
                     vias.append((pos.x, pos.y, layers))
+                drill = _drill(item)
+                if drill and layers:
+                    via_holes.append((drill, layers))
             elif isinstance(item, Pad):
                 layers = present.get(item.id.value, [])
                 if len(layers) >= 2:  # plated hole bridges its copper layers
@@ -303,12 +342,17 @@ class BoardReader:
                     if lid in on_board:
                         for shape in shapes:
                             polys.append((lid, _rings(shape)))
+                            poly_kinds.append(ZONE)
 
         for lid in copper:
             on_layer = [p for p in pads if lid in present.get(p.id.value, ())]
-            if on_layer:
-                for shape in self.board.get_pad_shapes_as_polygons(on_layer, lid):
-                    polys.append((lid, _rings(shape)))
+            # One request per kind, as the answer doesn't say which pad is which.
+            for kind in (PAD, THT):
+                of_kind = [p for p in on_layer if (_drill(p) is not None) == (kind == THT)]
+                if of_kind:
+                    for shape in self.board.get_pad_shapes_as_polygons(of_kind, lid):
+                        polys.append((lid, _rings(shape)))
+                        poly_kinds.append(kind)
 
         for seed in seeds:
             for lid in present.get(seed.id.value, []):
@@ -339,12 +383,15 @@ class BoardReader:
             if len(mapped) >= 2:
                 prims.vias.append((x, y, mapped))
         prims.bbox = _bbox(prims)
+        holes = [drill + ([idx[lid] for lid in layers if lid in idx],)
+                 for drill, layers in via_holes]
 
         return NetGeometry(
             prims,
             [self._layer_name(lid) for lid in layer_ids],
             [_COPPER_RGB.get(canonical_name(lid), (180, 180, 180)) for lid in layer_ids],
-            net, fingerprint, len(seeds), unfilled)
+            net, fingerprint, len(seeds), unfilled, disc_kinds, poly_kinds,
+            [h for h in holes if h[-1]])
 
     def _presence(self, items, copper):
         """Map item id -> copper layers (stack order) where it has copper."""
@@ -417,6 +464,23 @@ def _via_diameter(via, lid):
         if key in sizes:
             return sizes[key]
     return sizes.get(_F_CU) or next(iter(sizes.values()), 0)
+
+
+def _drill(item):
+    """A via's or pad's drill as (x, y, width, height, angle in degrees), or
+    None if it has none. width == height for a round drill, else a slot.
+
+    KiCad 9 reports the drill shape as unknown, so a drill counts as a slot
+    whenever its sizes differ (a round drill's are always equal), unless
+    KiCad says it is round."""
+    drill = item.padstack.drill
+    w, h = drill.diameter.x, drill.diameter.y
+    if w <= 0:
+        return None
+    if h <= 0 or drill.shape == DrillShape.DS_CIRCLE:
+        h = w
+    angle = item.padstack.angle.degrees if isinstance(item, Pad) else 0.0  # slots turn with the pad
+    return (item.position.x, item.position.y, w, h, angle)
 
 
 def _rings(shape):

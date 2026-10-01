@@ -100,6 +100,88 @@ def test_nearer_layer_shows_where_layers_overlap():
     assert far is not None and far > 10 * MM, far
 
 
+def test_hidden_vias_and_pads_are_not_drawn():
+    """A pad and a via on a track: hiding one kind drops only its shapes, and
+    the hidden copper reads as "no copper" while the track still shows."""
+    p = df.NetPrimitives()
+    p.num_layers = 1
+    p.polys = [(0, [square(2 * MM, 9 * MM, 2 * MM)]), (0, [square(12 * MM, 2 * MM, 6 * MM)])]
+    p.segments = [(0, 3 * MM, 10 * MM, 17 * MM, 10 * MM, int(0.3 * MM)),
+                  (0, 15 * MM, 8 * MM, 15 * MM, 10 * MM, int(0.3 * MM))]  # to the zone
+    p.discs = [(0, 17 * MM, 10 * MM, 1 * MM)]
+    p.sources = [(0, 3 * MM, 10 * MM)]
+    p.bbox = (2 * MM, 2 * MM, 18 * MM, 11 * MM)
+    discs, polys = ["via"], ["pad", "zone"]
+    everything = viewer.CopperShapes(p, 0, discs, polys)
+    assert len(everything.discs) == 1 and len(everything.polys) == 2
+    no_vias = viewer.CopperShapes(p, 0, discs, polys, hidden={"via"})
+    assert len(no_vias.discs) == 0 and len(no_vias.polys) == 2
+    no_pads = viewer.CopperShapes(p, 0, discs, polys, hidden={"pad"})
+    assert len(no_pads.discs) == 1 and len(no_pads.polys) == 1
+    assert no_pads.poly_boxes[0][0] == 12 * MM, "the zone must stay"
+
+    field = df.solve(p, 100_000)
+    heat = viewer.Heatmap(viewer.prepare_layers(field), field.origin, field.pitch_nm,
+                          field.max_distance_nm)
+    view = (200 / (20.0 * MM), (10.0 * MM, 10.0 * MM))      # 10 px per mm
+    bare = viewer.CopperShapes(p, 0, discs, polys, hidden={"pad", "via"})
+    shown = viewer.render_heatmap(heat, [everything], view, 200, 200, block=2)
+    hidden = viewer.render_heatmap(heat, [bare], view, 200, 200, block=2)
+    for px, py in ((25, 95), (175, 93)):                   # on the pad, on the via
+        assert shown.value_at(px, py) is not None, (px, py)
+        assert hidden.value_at(px, py) is None, (px, py)
+    assert hidden.value_at(100, 100) is not None           # the track still shows
+    assert hidden.value_at(140, 50) is not None            # and so does the zone
+
+
+def test_marks_follow_layers_and_switches():
+    """Pad outlines once per pad (not per layer), via drills only on shown
+    layers, and each only while its switch is on."""
+    p = df.NetPrimitives()
+    p.num_layers = 2
+    pad = square(0, 0, 2 * MM)
+    p.polys = [(0, [pad]), (1, [pad]), (1, [square(5 * MM, 0, 3 * MM)])]
+    kinds = ["pad", "pad", "zone"]
+    vias = [(6 * MM, MM, 300_000, 300_000, 0.0, [1])]
+    m = viewer.Marks(p, kinds, vias, [0, 1])
+    assert len(m.pad_rings) == 1 and m.via_holes.tolist() == [[6 * MM, MM, 3e5, 3e5, 0.0]]
+    assert len(viewer.Marks(p, kinds, vias, [0]).via_holes) == 0   # the via is on layer 1 only
+    m = viewer.Marks(p, kinds, vias, [0, 1], hidden={"pad"})
+    assert not m.pad_rings and len(m.via_holes) == 1
+    assert len(viewer.Marks(p, kinds, vias, [0, 1], hidden={"via"}).via_holes) == 0
+    # A through-hole pad's copper gets no outline (its drill marks it).
+    assert not viewer.Marks(p, ["tht", "tht", "zone"], vias, [0, 1]).pad_rings
+    assert set(viewer._SWITCHED["pad"]) == {"pad", "tht"}, "the Pads switch hides both"
+
+
+def test_board_holes_are_drawn_without_a_net():
+    """The board's drills show with the outline alone, cut out in the
+    background grey, before any pad or via is selected."""
+    frame = wx.Frame(None)
+    try:
+        view = viewer._BoardView(frame, wx.Size(200, 200))
+        view.SetSize(200, 200)
+        view.set_outline([square(0, 0, 20 * MM)], [])
+        view.set_holes([(10 * MM, 10 * MM, 4 * MM, 4 * MM, 0.0)])
+        bmp = wx.Bitmap(200, 200, 24)
+        dc = wx.MemoryDC(bmp)
+        view.draw(dc)
+        dc.SelectObject(wx.NullBitmap)
+        img = bmp.ConvertToImage()
+        assert (img.GetRed(100, 100), img.GetGreen(100, 100)) == viewer._BG_COLOUR[:2]
+        assert (img.GetRed(100, 40), img.GetGreen(100, 40)) == viewer._BOARD_COLOUR[:2]
+    finally:
+        frame.Destroy()
+
+
+def test_oblong_hole_outline():
+    """A 2 x 1 slot turned 90 degrees stands upright, with round ends."""
+    pts = viewer._oblong(0.0, 0.0, 1.0, 0.5, 90.0)
+    assert np.allclose(pts[0], pts[-1]), "the outline must be closed"
+    assert np.allclose(np.abs(pts).max(axis=0), (0.5, 1.0))
+    assert np.allclose(np.abs(viewer._oblong(0.0, 0.0, 0.5, 1.0, 0.0)).max(axis=0), (0.5, 1.0))
+
+
 def test_board_view_draws_outline_and_messages():
     """Painting with a message up must not fail (it used to leave the view
     black at startup), and the startup note goes once the outline is in."""

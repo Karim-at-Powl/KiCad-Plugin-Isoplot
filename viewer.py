@@ -2,8 +2,9 @@
 to KiCad and redraws whenever the live session delivers a new result.
 
 Neither KiCad API can put pixels on the board canvas, so the heatmap lives in
-its own window, with a per-layer toggle list, a legend and a cursor readout of
-the along-copper distance and board position.
+its own window, with a per-layer toggle list, switches to hide the net's vias
+and pads, a legend and a cursor readout of the along-copper distance and board
+position.
 
 The heatmap is rendered at screen resolution rather than as an enlarged grid:
 the copper's outline comes from the exact shapes read from KiCad (drawn
@@ -21,11 +22,17 @@ import wx
 _BG_COLOUR = (215, 215, 215)       # outside the board
 _BOARD_COLOUR = (245, 245, 245)    # inside the board outline
 _EDGE_COLOUR = (70, 70, 70)        # Edge.Cuts
+_PAD_COLOUR = (85, 85, 85)         # pad outlines
+_HOLE_FILL = (184, 115, 51)        # via holes: copper ...
+_HOLE_RIM = (240, 200, 60)         # ... with a golden rim
 _OPACITY = 0.6
 _VIEW_W = 760                      # initial board view size (DIP)
 _VIEW_H = 620
 _SETTLE_MS = 120                   # re-render this long after the last zoom/pan
 _STARTING = "Starting..."          # shown until the board outline arrives
+_NO_HOLES = np.zeros((0, 5))
+# The kinds of copper (kicad_source.NetGeometry) each "Show" switch hides.
+_SWITCHED = {"via": ("via",), "pad": ("pad", "tht")}
 MM = 1e6
 
 
@@ -183,15 +190,69 @@ def _bridged(rings):
 class CopperShapes:
     """The copper of one layer as arrays (nm), for drawing."""
 
-    def __init__(self, prims, layer):
+    def __init__(self, prims, layer, disc_kinds=None, poly_kinds=None, hidden=()):
+        """``disc_kinds`` / ``poly_kinds``: what each of ``prims.discs`` /
+        ``prims.polys`` came from ("via", "pad", "tht", "zone"); kinds in ``hidden``
+        are not drawn. Hidden copper still counts in the distances."""
+        def shown(kinds, i):
+            return kinds is None or kinds[i] not in hidden
+
         self.segments = np.array([s[1:] for s in prims.segments if s[0] == layer],
                                  dtype=np.float64).reshape(-1, 5)   # x0 y0 x1 y1 width
-        self.discs = np.array([d[1:] for d in prims.discs if d[0] == layer],
+        self.discs = np.array([d[1:] for i, d in enumerate(prims.discs)
+                               if d[0] == layer and shown(disc_kinds, i)],
                               dtype=np.float64).reshape(-1, 3)      # x y r
-        polys = (_bridged(rings) for (li, rings) in prims.polys if li == layer)
+        polys = (_bridged(rings) for i, (li, rings) in enumerate(prims.polys)
+                 if li == layer and shown(poly_kinds, i))
         self.polys = [p for p in polys if p is not None]
         self.poly_boxes = np.array([(p[:, 0].min(), p[:, 1].min(), p[:, 0].max(), p[:, 1].max())
                                     for p in self.polys], dtype=np.float64).reshape(-1, 4)
+
+
+class Marks:
+    """The net's SMD pad outlines and via drills on the shown layers, drawn
+    on top of the heatmap so they stand out. Board nm. Through-hole pads get
+    no outline: their drill (drawn with the board, see _BoardView.set_holes)
+    marks them, and in a pour the pad outline stands for nothing physical."""
+
+    def __init__(self, prims, poly_kinds, via_holes, layers, hidden=()):
+        """``poly_kinds`` / ``via_holes``: as in kicad_source.NetGeometry;
+        ``layers``: the shown layer indices; kinds in ``hidden`` are left out."""
+        shown = set(layers)
+        self.pad_rings = []
+        if "pad" not in hidden:
+            seen = set()    # a pad on several layers has the same outline on each
+            for (li, rings), kind in zip(prims.polys, poly_kinds):
+                if kind != "pad" or li not in shown:
+                    continue
+                for ring in rings:
+                    if len(ring) < 3:
+                        continue
+                    key = (len(ring), tuple(ring[0]), tuple(ring[len(ring) // 2]))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    self.pad_rings.append(np.asarray(list(ring) + [ring[0]], dtype=np.float64))
+        self.ring_boxes = np.array([(r[:, 0].min(), r[:, 1].min(), r[:, 0].max(), r[:, 1].max())
+                                    for r in self.pad_rings], dtype=np.float64).reshape(-1, 4)
+        self.via_holes = np.array([h[:5] for h in via_holes
+                                   if "via" not in hidden and shown & set(h[5])],
+                                  dtype=np.float64).reshape(-1, 5)   # x y width height angle
+
+
+def _oblong(cx, cy, a, b, angle_deg, n=11):   # odd n: a point on each tip
+    """Outline (screen points) of a slot with half-sizes ``a`` along its own x
+    and ``b`` along its own y, turned by ``angle_deg`` the KiCad way
+    (anticlockwise on screen, y pointing down)."""
+    r = min(a, b)
+    t = np.linspace(-np.pi / 2, np.pi / 2, n)
+    cap = np.column_stack((abs(a - b) + r * np.cos(t), r * np.sin(t)))
+    local = np.vstack((cap, -cap, cap[:1]))     # closed, so the rim has no gap
+    if b > a:
+        local = local[:, ::-1]          # the long side is the slot's own y
+    c, s = np.cos(np.radians(angle_deg)), np.sin(np.radians(angle_deg))
+    x, y = local[:, 0], local[:, 1]
+    return np.column_stack((cx + x * c + y * s, cy - x * s + y * c))
 
 
 def _screen_poly(pts, s, ox, oy):
@@ -402,6 +463,8 @@ class _BoardView(wx.Panel):
         self._shapes = None             # [CopperShapes] per heatmap layer
         self._content = 0               # bumped whenever heat/shapes change
         self._seeds = ()                # ("disc", x, y, r) / ("poly", points) in nm
+        self._marks = None              # Marks: the net's pad outlines and via drills
+        self._holes = _NO_HOLES         # the board's pad drills: x y width height angle
         self._rings = []                # closed board outline rings (nm)
         self._chains = []               # open outline pieces (nm)
         self._message = _STARTING
@@ -437,9 +500,15 @@ class _BoardView(wx.Panel):
             self.fit()
         self._invalidate()
 
-    def set_heatmap(self, heat, shapes, seeds):
+    def set_holes(self, holes):
+        """The board's pad drills, (x, y, width, height, angle) each; drawn
+        like the outline's cut-outs, whatever net is shown."""
+        self._holes = np.array(holes, dtype=np.float64).reshape(-1, 5)
+        self._invalidate()
+
+    def set_heatmap(self, heat, shapes, seeds, marks=None):
         had_frame = self._bounds() is not None
-        self._heat, self._shapes, self._seeds = heat, shapes, seeds
+        self._heat, self._shapes, self._seeds, self._marks = heat, shapes, seeds, marks
         self._content += 1
         self._message = None
         if not had_frame:
@@ -450,6 +519,7 @@ class _BoardView(wx.Panel):
         self._heat = self._shapes = None
         self._content += 1
         self._seeds = ()
+        self._marks = None
         self._message = text
         self._invalidate()
 
@@ -623,9 +693,13 @@ class _BoardView(wx.Panel):
             gc.DrawLines(self._screen_pts(_bridged(self._rings), view), wx.ODDEVEN_RULE)
 
     def _draw_overlay(self, gc, view):
-        """Board outline and seed copper, on top of the heatmap."""
+        """Pad outlines, board outline, seed copper and drills, on top of the
+        heatmap."""
+        if self._marks is not None:
+            self._draw_pad_outlines(gc, view)
         gc.SetPen(gc.CreatePen(wx.GraphicsPenInfo(wx.Colour(*_EDGE_COLOUR),
                                                   1.5 * self.GetDPIScaleFactor())))
+        gc.SetBrush(wx.TRANSPARENT_BRUSH)
         for poly in self._rings + self._chains:
             gc.StrokeLines(self._screen_pts(poly, view))
 
@@ -639,6 +713,69 @@ class _BoardView(wx.Panel):
                 gc.DrawEllipse(sx - r, sy - r, 2 * r, 2 * r)
             else:
                 gc.DrawLines(self._screen_pts(shape[1], view), wx.ODDEVEN_RULE)
+        self._draw_holes(gc, view)
+
+    def _world_viewport(self, view):
+        w, h = self.GetClientSize()
+        return self.to_world(0, 0, view) + self.to_world(w, h, view)
+
+    def _draw_pad_outlines(self, gc, view):
+        b = self._marks.ring_boxes
+        if not len(b):
+            return
+        x0, y0, x1, y1 = self._world_viewport(view)
+        gc.SetPen(gc.CreatePen(wx.GraphicsPenInfo(wx.Colour(*_PAD_COLOUR),
+                                                  1.5 * self.GetDPIScaleFactor())))
+        gc.SetBrush(wx.TRANSPARENT_BRUSH)
+        seen = (b[:, 0] <= x1) & (b[:, 2] >= x0) & (b[:, 1] <= y1) & (b[:, 3] >= y0)
+        for i in np.flatnonzero(seen):
+            gc.StrokeLines(self._screen_pts(self._marks.pad_rings[i], view))
+
+    def _draw_holes(self, gc, view):
+        """Each drill at its real size, never smaller than a few pixels so
+        vias stay visible zoomed out. The net's vias are copper with a golden
+        rim; the board's pad drills (any net, plated or not) are cut out like
+        the board outline's cut-outs (the background grey, edged like
+        Edge.Cuts)."""
+        dpi = self.GetDPIScaleFactor()
+        if self._marks is not None:
+            self._draw_drills(gc, view, self._marks.via_holes, _HOLE_FILL, _HOLE_RIM,
+                              lambda r: min(max(0.15 * r, dpi), 0.4 * r, 4 * dpi))
+        self._draw_drills(gc, view, self._holes, _BG_COLOUR, _EDGE_COLOUR,
+                          lambda r: min(1.5 * dpi, 0.4 * r))
+
+    def _draw_drills(self, gc, view, holes, fill, rim_colour, rim_width):
+        """``rim_width(radius)``: rim in px for a hole of ``radius`` px."""
+        if not len(holes):
+            return
+        x0, y0, x1, y1 = self._world_viewport(view)
+        r = holes[:, 2:4].max(axis=1) / 2.0
+        holes = holes[(holes[:, 0] + r >= x0) & (holes[:, 0] - r <= x1)
+                      & (holes[:, 1] + r >= y0) & (holes[:, 1] - r <= y1)]
+        s = view[0]
+        min_r = 1.5 * self.GetDPIScaleFactor()
+        gc.SetBrush(wx.Brush(wx.Colour(*fill)))
+        rim_colour = wx.Colour(*rim_colour)
+
+        def rim_pen(radius):
+            rim = rim_width(radius)
+            gc.SetPen(gc.CreatePen(wx.GraphicsPenInfo(rim_colour, rim)))
+            return rim
+
+        pts = self._screen_pts(holes[:, :2], view)
+        round_ = holes[:, 2] == holes[:, 3]
+        for d in np.unique(holes[round_, 2]):     # one path per drill size
+            radius = max(d / 2.0 * s, min_r)
+            inner = radius - rim_pen(radius) / 2.0   # the rim ends at the drill edge
+            path = gc.CreatePath()
+            for x, y in pts[round_ & (holes[:, 2] == d)]:
+                path.AddCircle(x, y, inner)
+            gc.DrawPath(path)
+        for (x, y), (_, _, w, h, angle) in zip(pts[~round_], holes[~round_]):   # slots
+            a, b = max(w / 2.0 * s, min_r), max(h / 2.0 * s, min_r)
+            inset = rim_pen(min(a, b)) / 2.0
+            n = 2 * int(np.clip(min(a, b) / 2.0, 5, 40)) + 1    # smooth ends at any zoom
+            gc.DrawLines(_oblong(x, y, a - inset, b - inset, angle, n))
 
     def _current_render(self, view):
         cache = self._cache
@@ -746,6 +883,7 @@ class IsoplotFrame(wx.Frame):
         self._layer_names = None
         self._unticked = set()      # layer names the user switched off
         self._checks = []           # (layer_index, wx.CheckBox)
+        self._kind_checks = {}      # "via"/"pad" -> wx.CheckBox ("Show" switches)
         self._fixed = []            # (window, size in DIP), re-applied on DPI change
         self._status = ""           # last status text (restored after "busy")
         self._busy = False
@@ -777,6 +915,19 @@ class IsoplotFrame(wx.Frame):
         right.Add(wx.StaticText(p, label="Layers:"), 0, wx.BOTTOM, d(4))
         self._layers = wx.BoxSizer(wx.VERTICAL)
         right.Add(self._layers, 0)
+        right.Add(wx.StaticText(p, label="Show:"), 0, wx.TOP | wx.BOTTOM, d(4))
+        for kind, label, tip in (
+                ("via", "Vias", "Draw the net's vias, with the drill at its real size.\n"
+                                "Hidden vias still join the layers in the distances."),
+                ("pad", "Pads", "Draw the net's pads (SMD pads outlined in grey).\n"
+                                "Hidden pads still count in the distances; the "
+                                "selected copper stays marked in black.")):
+            cb = wx.CheckBox(p, label=label)
+            cb.SetValue(True)
+            cb.SetToolTip(tip)
+            cb.Bind(wx.EVT_CHECKBOX, self._redraw)
+            right.Add(cb, 0, wx.BOTTOM, d(6))
+            self._kind_checks[kind] = cb
         right.AddStretchSpacer(1)
 
         self._follow = wx.CheckBox(p, label="Follow selection")
@@ -793,7 +944,8 @@ class IsoplotFrame(wx.Frame):
         refresh.Bind(wx.EVT_BUTTON, lambda e: self._session and self._session.refresh())
         right.Add(refresh, 0, wx.TOP | wx.EXPAND, d(8))
         outline = wx.Button(p, label="Update Board Outline")
-        outline.SetToolTip("Re-read Edge.Cuts after editing the board outline")
+        outline.SetToolTip("Re-read Edge.Cuts and the board's drill holes now\n"
+                           "(holes also follow edits by themselves within a few seconds)")
         outline.Bind(wx.EVT_BUTTON,
                      lambda e: self._session and self._session.refresh_outline())
         right.Add(outline, 0, wx.TOP | wx.EXPAND, d(4))
@@ -886,6 +1038,9 @@ class IsoplotFrame(wx.Frame):
     def set_outline(self, rings, chains):
         self._view.set_outline(rings, chains)
 
+    def set_holes(self, holes):
+        self._view.set_holes(holes)
+
     def show_message(self, text):
         self._geometry = self._field = self._display = None
         self._summary = ""
@@ -943,8 +1098,13 @@ class IsoplotFrame(wx.Frame):
             return
         heat = Heatmap([self._display[li] for li in layers], field.origin, field.pitch_nm,
                        field.max_distance_nm)
-        shapes = [CopperShapes(self._geometry.prims, li) for li in layers]
-        self._view.set_heatmap(heat, shapes, self._seed_shapes())
+        g = self._geometry
+        hidden = {kind for switch, cb in self._kind_checks.items() if not cb.GetValue()
+                  for kind in _SWITCHED[switch]}
+        shapes = [CopperShapes(g.prims, li, g.disc_kinds, g.poly_kinds, hidden)
+                  for li in layers]
+        marks = Marks(g.prims, g.poly_kinds, g.via_holes, layers, hidden)
+        self._view.set_heatmap(heat, shapes, self._seed_shapes(), marks)
 
     def _seed_shapes(self):
         """Seed copper outlines in board coordinates (nm)."""

@@ -44,7 +44,7 @@ def track(uid, net, layer, x0, y0, x1, y1, w=250_000):
     return Track(proto=t)
 
 
-def via(uid, net, x, y, dia=600_000):
+def via(uid, net, x, y, dia=600_000, drill=300_000):
     v = bt.Via()
     v.id.value = uid
     v.net.name = net
@@ -52,6 +52,8 @@ def via(uid, net, x, y, dia=600_000):
     v.type = bt.ViaType.VT_THROUGH
     v.pad_stack.type = bt.PadStackType.PST_NORMAL
     v.pad_stack.layers.extend([F, B])
+    v.pad_stack.drill.shape = bt.DrillShape.DS_CIRCLE
+    v.pad_stack.drill.diameter.x_nm = v.pad_stack.drill.diameter.y_nm = drill
     cl = v.pad_stack.copper_layers.add()
     cl.layer = F
     cl.size.x_nm = cl.size.y_nm = dia
@@ -66,6 +68,18 @@ def smd_pad(uid, net, x, y):
     p.type = bt.PadType.PT_SMD
     p.pad_stack.layers.extend([F])
     return Pad(proto=p)
+
+
+def tht_pad(uid, net, x, y, drill=(1_000_000, 600_000), angle=90.0):
+    """A plated through-hole pad on F and B with an oblong drill (a slot)."""
+    pad = smd_pad(uid, net, x, y)
+    p = pad.proto
+    p.type = bt.PadType.PT_PTH
+    p.pad_stack.layers.append(B)
+    p.pad_stack.drill.shape = bt.DrillShape.DS_OBLONG
+    p.pad_stack.drill.diameter.x_nm, p.pad_stack.drill.diameter.y_nm = drill
+    p.pad_stack.angle.value_degrees = angle
+    return pad
 
 
 def zone(uid, net, layer, rect, filled=True):
@@ -102,7 +116,7 @@ class FakeBoard:
     def check_padstack_presence_on_layers(self, items, layers):
         out = {}
         for i in items:
-            on = {F, B} if isinstance(i, Via) else {F}
+            on = set(i.padstack.layers)
             out[i] = {lid: lid in on for lid in layers}
         return out
 
@@ -165,6 +179,93 @@ def test_selection_and_fetch():
     assert 30.0 < far < 36.0, far
 
 
+def test_discs_and_polys_are_tagged_with_their_item_kind():
+    """The viewer hides vias/pads by these tags: one per disc / polygon."""
+    g = ks.BoardReader(board_fixture()).fetch(("pad1",))
+    p = g.prims
+    assert g.disc_kinds == [ks.VIA, ks.VIA], g.disc_kinds          # v1 on F and B
+    assert len(g.poly_kinds) == len(p.polys)
+    by_kind = {kind: [li for (li, _), k in zip(p.polys, g.poly_kinds) if k == kind]
+               for kind in (ks.PAD, ks.ZONE)}
+    assert by_kind == {ks.PAD: [0], ks.ZONE: [1]}, by_kind
+    # The same tags without the padstack-presence query (KiCad before 9.0.3).
+    old = ks.BoardReader(board_fixture(), ks.KiCadFeatures((9, 0, 2))).fetch(("pad1",))
+    assert (old.disc_kinds, old.poly_kinds) == (g.disc_kinds, g.poly_kinds)
+    # ... and through the per-net query of KiCad 10.0.1+.
+    board = FakeBoardV10(board_fixture().items)
+    new = ks.BoardReader(board, ks.KiCadFeatures((10, 0, 1))).fetch(("pad1",))
+    assert "get_items_by_net" in board.calls
+    assert (new.disc_kinds, new.poly_kinds) == (g.disc_kinds, g.poly_kinds)
+
+
+def mounting_hole(uid, x, y, drill=3_200_000):
+    """A non-plated hole: a pad on no net, without copper."""
+    pad = smd_pad(uid, "", x, y)
+    p = pad.proto
+    p.type = bt.PadType.PT_NPTH
+    p.pad_stack.drill.shape = bt.DrillShape.DS_CIRCLE
+    p.pad_stack.drill.diameter.x_nm = p.pad_stack.drill.diameter.y_nm = drill
+    return pad
+
+
+def test_slots_without_a_drill_shape():
+    """KiCad 9 reports every drill shape as unknown: unequal sizes make a
+    slot, equal ones a round drill, and an explicit circle stays round."""
+    for shape, size, expected in ((bt.DrillShape.DS_UNKNOWN, (2_200_000, 1_000_000), 1_000_000),
+                                  (bt.DrillShape.DS_UNKNOWN, (900_000, 900_000), 900_000),
+                                  (bt.DrillShape.DS_OBLONG, (2_200_000, 1_000_000), 1_000_000),
+                                  (bt.DrillShape.DS_CIRCLE, (900_000, 0), 900_000)):
+        pad = tht_pad("p", "N", 0, 0, drill=size, angle=180.0)
+        pad.proto.pad_stack.drill.shape = shape
+        assert ks._drill(pad) == (0, 0, size[0], expected, 180.0), (shape, size, ks._drill(pad))
+
+
+def test_through_hole_pads_are_tagged_apart_from_smd_pads():
+    """The viewer outlines SMD pads only; through-hole pads keep their copper
+    in the heatmap under their own kind."""
+    board = board_fixture()
+    board.items.append(tht_pad("tht", "SIG", 5 * MM, 5 * MM))
+    g = ks.BoardReader(board).fetch(("pad1",))
+    kinds = sorted(k for k in g.poly_kinds if k in (ks.PAD, ks.THT))
+    assert kinds == [ks.PAD, ks.THT], g.poly_kinds     # the fake board has pad shapes on F only
+
+
+def test_net_geometry_carries_only_the_via_drills():
+    board = board_fixture()
+    board.items.append(tht_pad("tht", "SIG", 5 * MM, 5 * MM))
+    g = ks.BoardReader(board).fetch(("pad1",))
+    assert g.via_holes == [(20 * MM, 0, 300_000, 300_000, 0.0, [0, 1])], g.via_holes
+    # Before KiCad 9.0.3 (no padstack-presence query) they are the same.
+    old = ks.BoardReader(board, ks.KiCadFeatures((9, 0, 2))).fetch(("pad1",))
+    assert old.via_holes == g.via_holes
+
+
+def test_board_holes_come_from_the_snapshot():
+    """All pads' drills, any net and plated or not, at their real size; a
+    slot keeps its shape and the pad's angle; SMD pads and vias are left out.
+    No extra request: they follow the snapshot, on any KiCad version."""
+    items = board_fixture().items + [tht_pad("tht", "GND", 5 * MM, 5 * MM),
+                                     mounting_hole("mh", 30 * MM, 30 * MM)]
+    for version in ((9, 0, 5), (10, 0, 1)):
+        board = FakeBoardV10(items)
+        clock = [0.0]
+        reader = ks.BoardReader(board, ks.KiCadFeatures(version), clock=lambda: clock[0])
+        assert reader.board_holes() is None                  # no snapshot yet
+        reader.keep_snapshot_fresh()
+        holes = reader.board_holes()
+        assert holes == ((5 * MM, 5 * MM, 1_000_000, 600_000, 90.0),
+                         (30 * MM, 30 * MM, 3_200_000, 3_200_000, 0.0)), holes
+        assert reader.board_holes() is holes                 # worked out once per snapshot
+        reads = board.calls.count("get_items")
+        items[-1].proto.position.x_nm = 31 * MM              # the mounting hole moves
+        reader.keep_snapshot_fresh()                         # not due yet
+        assert reader.board_holes() is holes
+        reader.keep_snapshot_fresh(now=True)                 # "Update Board Outline"
+        assert reader.board_holes()[1][0] == 31 * MM
+        assert board.calls.count("get_items") == reads + 1
+        items[-1].proto.position.x_nm = 30 * MM
+
+
 def test_seed_errors():
     board = board_fixture()
     reader = ks.BoardReader(board)
@@ -213,6 +314,7 @@ def _same_geometry(a, b):
         assert getattr(a.prims, attr) == getattr(b.prims, attr), attr
     assert (a.net_name, a.layer_names, a.seed_count, a.unfilled_zones) == \
         (b.net_name, b.layer_names, b.seed_count, b.unfilled_zones)
+    assert (a.disc_kinds, a.poly_kinds) == (b.disc_kinds, b.poly_kinds)
 
 
 def test_per_net_query_matches_whole_board_read():

@@ -104,6 +104,7 @@ class LiveSession:
         last_fp = None
         next_geometry = 0.0
         outline_fp = None
+        holes = None                # board_holes() as last sent to the window
         unreachable_since = None
         busy_since = None
         busy_shown = False
@@ -143,7 +144,7 @@ class LiveSession:
                     log.info("connected to %s", features)
                 if reader is None:
                     reader = ks.BoardReader(kicad.get_board(), features)
-                    seed_ids, last_fp, outline_fp = (), None, None
+                    seed_ids, last_fp, outline_fp, holes = (), None, None, None
                     log.info("attached to board %s", reader.name)
                     status("Connected to %s" % reader.name)
                 unreachable_since = None
@@ -151,11 +152,12 @@ class LiveSession:
                 # The outline is read when attaching to a board and on request
                 # ("Update Board Outline"), not polled. KiCad refuses it while
                 # busy (e.g. one pad selected); it is simply tried again.
+                refresh_holes = False
                 if outline_fp is None or self._outline_request:
                     outline = self._try_while_busy(reader.board_outline)
                     if outline is not None:
                         fp, rings, chains = outline
-                        self._outline_request = False
+                        refresh_holes, self._outline_request = self._outline_request, False
                         if fp != outline_fp:
                             outline_fp = fp
                             self._post("set_outline", rings, chains)
@@ -167,7 +169,13 @@ class LiveSession:
                     seed_ids, last_fp = selected, None
                     changed_at = time.perf_counter()
                 # Kept current so a seed can be resolved while KiCad is busy.
-                reader.keep_snapshot_fresh()
+                # The board's pad drills come from it too, so moved holes show
+                # up within a few seconds.
+                reader.keep_snapshot_fresh(now=refresh_holes)
+                board_holes = reader.board_holes()
+                if board_holes is not None and board_holes is not holes and board_holes != holes:
+                    holes = board_holes
+                    self._post("set_holes", holes)
 
                 if not seed_ids:
                     status("Select a pad or via in the PCB editor")
