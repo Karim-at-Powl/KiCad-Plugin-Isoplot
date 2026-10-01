@@ -88,6 +88,16 @@ Restart KiCad. A "Net Isoplot" button appears in the PCB editor's toolbar.
 Pressing it while the window is already open brings the window forward and
 switches it to the current selection.
 
+## Release (Plugin and Content Manager)
+
+`python build_pcm.py` checks the metadata and writes `dist/net-isoplot-<version>.zip`
+plus `dist/submission/packages/tech.powl.net-isoplot/` (metadata with download URL,
+SHA-256 and sizes, and the icon). Upload the zip to the GitHub release
+`v<version>`, then copy the submission folder into a fork of
+[kicad/addons/metadata](https://gitlab.com/kicad/addons/metadata) and open a
+merge request. The version packaged is the first entry of `versions` in
+`metadata.json`.
+
 ## How it works
 
 Each module has a single job, and only one of them talks to KiCad:

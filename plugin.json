@@ -1,6 +1,6 @@
 {
     "$schema": "https://go.kicad.org/api/schemas/v1",
-    "identifier": "tech.powl.net_isoplot",
+    "identifier": "tech.powl.net-isoplot",
     "name": "Net Isoplot",
     "description": "Live heatmap of along-copper distance from the selected pad/via to the rest of its net",
     "runtime": {
