@@ -26,6 +26,7 @@ import os
 import re
 import struct
 import sys
+import time
 import zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -103,8 +104,13 @@ def build():
 
     install_size = 0
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+        # Stamped with the source file's time (not now), so rebuilding
+        # unchanged sources gives the same archive and SHA-256.
         data = (json.dumps(packaged, indent=4) + "\n").encode()
-        z.writestr("metadata.json", data)
+        mtime = os.path.getmtime(os.path.join(HERE, "metadata.json"))
+        info = zipfile.ZipInfo("metadata.json", time.localtime(mtime)[:6])
+        info.compress_type = zipfile.ZIP_DEFLATED
+        z.writestr(info, data)
         install_size += len(data)
         for rel in PLUGIN_FILES:
             src = os.path.join(HERE, rel)

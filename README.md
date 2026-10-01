@@ -1,6 +1,18 @@
 # Net Isoplot
 
-A KiCad plugin that shows a **live distance heatmap** of a net in a separate window. 
+A KiCad plugin that shows a **live distance heatmap** of a net in a separate window.
+Hover the cursor over the plot to see the values in the top left corner.
+
+<table>
+  <tr>
+    <td width="50%"><img src="pictures/isoplot.png" alt="Isoplot of a GND net"></td>
+    <td width="50%"><img src="pictures/delta.png" alt="Delta mode comparing two pads"></td>
+  </tr>
+  <tr>
+    <td align="center"><em>Isoplot: distance along the GND copper from the selected pad, red (near) to blue (furthest).</em></td>
+    <td align="center"><em>Delta: which of two pads is nearer along the copper, white where both are equally far.</em></td>
+  </tr>
+</table>
 
 ## How to use it
 
